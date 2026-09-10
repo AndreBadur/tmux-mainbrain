@@ -1,7 +1,19 @@
+# --- Python caches ---
 __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
 
-# Operational journey state — ephemeral, not versioned
+# --- Backups / editor cruft ---
+*.bak
+*.swp
+*~
+
+# --- Operational journey state (ephemeral, per-environment) ---
 journeys/*
+
+# --- Palace: keep the folder in git but ignore ALL its contents ---
+# (so the structure exists in a fresh environment, but no operational
+#  data / curated knowledge / knights-index is versioned)
+palace/*
+!palace/.gitkeep
