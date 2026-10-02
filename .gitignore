@@ -9,6 +9,11 @@ __pycache__/
 *.swp
 *~
 
+# --- Secrets: never version tokens or the MCP config that may hold them ---
+.kiro/mcp.json
+.env.secrets
+*.secrets
+
 # --- Operational journey state (ephemeral, per-environment) ---
 journeys/*
 
@@ -17,3 +22,6 @@ journeys/*
 #  data / curated knowledge / knights-index is versioned)
 palace/*
 !palace/.gitkeep
+
+# capacitate_from_repo scratch/forge output
+.cap-forge/

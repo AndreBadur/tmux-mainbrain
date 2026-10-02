@@ -481,6 +481,293 @@ def test_deliver_empty_prompt_refused():
 
 
 # --------------------------------------------------------------------------- #
+# .env.secrets injection (_secret_env_flags) — null-tolerant, first-= split
+# --------------------------------------------------------------------------- #
+def test_secret_env_flags_absent_file_is_noop():
+    # Point the repo root at an empty tmpdir (no .env.secrets) -> [] , no crash.
+    import os as _os
+    from motor import tmux_driver as td
+    with tempfile.TemporaryDirectory() as tmp:
+        prev = _os.environ.get("TMUX_MAINBRAIN_ROOT")
+        _os.environ["TMUX_MAINBRAIN_ROOT"] = tmp
+        try:
+            assert td._secret_env_flags() == []
+        finally:
+            if prev is None:
+                _os.environ.pop("TMUX_MAINBRAIN_ROOT", None)
+            else:
+                _os.environ["TMUX_MAINBRAIN_ROOT"] = prev
+
+
+def test_secret_env_flags_parses_export_comments_and_first_equals():
+    import os as _os
+    from motor import tmux_driver as td
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / ".env.secrets").write_text(
+            "# a comment\n"
+            "\n"
+            "export JIRA_TOKEN=abc123\n"
+            "PLAIN_KEY=def456\n"
+            'GERRIT_INSTANCES={"internal": {"url": "https://x", "token": "t=t"}}\n',
+            encoding="utf-8",
+        )
+        prev = _os.environ.get("TMUX_MAINBRAIN_ROOT")
+        _os.environ["TMUX_MAINBRAIN_ROOT"] = tmp
+        try:
+            flags = td._secret_env_flags()
+        finally:
+            if prev is None:
+                _os.environ.pop("TMUX_MAINBRAIN_ROOT", None)
+            else:
+                _os.environ["TMUX_MAINBRAIN_ROOT"] = prev
+        # -e KEY=VAL pairs, comments/blanks skipped, first-'=' split preserves
+        # a value that itself contains '='.
+        assert flags[0] == "-e" and flags[1] == "JIRA_TOKEN=abc123"
+        assert "-e" in flags and "PLAIN_KEY=def456" in flags
+        gi = [flags[i + 1] for i in range(0, len(flags), 2)
+              if flags[i + 1].startswith("GERRIT_INSTANCES=")][0]
+        assert gi == 'GERRIT_INSTANCES={"internal": {"url": "https://x", "token": "t=t"}}'
+        assert len([f for f in flags if f == "-e"]) == 3  # 3 real vars, comment dropped
+
+
+# --------------------------------------------------------------------------- #
+# capacitate_from_repo — shape detection + producers (local fixtures, NO net)
+# --------------------------------------------------------------------------- #
+def _fake_clone(fixture: Path):
+    """Return a clone_fn that copies a local fixture dir into the clone target."""
+    import shutil as _sh
+
+    def _clone(_url, dest, _branch):
+        _sh.copytree(fixture, dest)
+    return _clone
+
+
+def _assert_valid_front_matter(agent_text: str) -> None:
+    """The agent's YAML front matter must parse (regression: unquoted colon)."""
+    assert agent_text.startswith("---\n")
+    fm = agent_text.split("---", 2)[1]
+    try:
+        import yaml  # type: ignore
+    except ImportError:
+        # No PyYAML: at least assert the description is quoted (the failure mode).
+        for line in fm.splitlines():
+            if line.startswith("description:"):
+                val = line.split(":", 1)[1].strip()
+                assert val.startswith('"') and val.endswith('"'), \
+                    f"description must be quoted, got: {val}"
+        return
+    parsed = yaml.safe_load(fm)
+    assert isinstance(parsed, dict) and parsed.get("name")
+
+
+def _make_power_fixture_legacy(root: Path) -> Path:
+    """A legacy POWER.md bundle (like design-system-scaffold)."""
+    d = root / "src-power"
+    (d / "steering").mkdir(parents=True)
+    (d / "POWER.md").write_text(
+        "---\nname: design-thing\ndisplayName: Design Thing\n"
+        "description: A design system power.\nkeywords:\n"
+        "  - design-system\n  - ui\n  - theming\nauthor: AWS\nversion: 1.0.0\n---\n\n"
+        "# Design Thing\nGuidance body.\n", encoding="utf-8")
+    (d / "steering" / "guide.md").write_text("# guide\n", encoding="utf-8")
+    return d
+
+
+def _make_power_fixture_plugin(root: Path) -> Path:
+    """A modern plugin.json power."""
+    d = root / "src-plugin"
+    (d / "skills" / "setup").mkdir(parents=True)
+    (d / "plugin.json").write_text(json.dumps({
+        "name": "supa", "version": "1.0.0", "description": "x",
+        "keywords": ["database", "postgres"]}), encoding="utf-8")
+    (d / "skills" / "setup" / "SKILL.md").write_text(
+        "---\nname: setup\n---\n# setup\n", encoding="utf-8")
+    return d
+
+
+def _make_agents_fixture(root: Path) -> Path:
+    d = root / "src-agents"
+    (d / ".kiro" / "agents").mkdir(parents=True)
+    (d / ".kiro" / "agents" / "coder.md").write_text(
+        "---\nname: coder\ndescription: A coder.\n---\n# coder\nYou write code.\n",
+        encoding="utf-8")
+    (d / "README.md").write_text("# repo\n", encoding="utf-8")
+    return d
+
+
+def _make_code_fixture(root: Path) -> Path:
+    d = root / "src-code"
+    (d / "src").mkdir(parents=True)
+    (d / "README.md").write_text(
+        "# Cool Lib\n\nA fast JSON parser for embedded systems.\n\n"
+        "## Install\n`npm i cool-lib`\n", encoding="utf-8")
+    (d / "package.json").write_text('{"name":"cool-lib"}', encoding="utf-8")
+    (d / "src" / "index.js").write_text("module.exports = {}\n", encoding="utf-8")
+    return d
+
+
+def test_detect_shape_power_legacy_and_plugin():
+    from motor.capacitate import detect_shape, Shape
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        assert detect_shape(_make_power_fixture_legacy(root)) == Shape.POWER
+        assert detect_shape(_make_power_fixture_plugin(root)) == Shape.POWER
+
+
+def test_detect_shape_agents_and_code():
+    from motor.capacitate import detect_shape, Shape
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        assert detect_shape(_make_agents_fixture(root)) == Shape.AGENTS
+        assert detect_shape(_make_code_fixture(root)) == Shape.CODE
+
+
+def test_capacitate_power_legacy_forges_file_bind():
+    from motor.capacitate import capacitate_from_repo
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        fixture = _make_power_fixture_legacy(root)
+        out = capacitate_from_repo("https://x/design-thing", dest=str(root / "forge"),
+                                   clone_fn=_fake_clone(fixture))
+        assert out["shape"] == "power"
+        assert out["bind"] == "file-resources"  # cheap FILE bind, not injection
+        assert out["manifest"] == "POWER.md"
+        assert "design-system" in out["keywords"]
+        # both a power file and a binding agent were written
+        power_file = Path(out["power_file"])
+        agent_file = Path(out["agent_file"])
+        assert power_file.is_file() and agent_file.is_file()
+        assert power_file.parent.name == "powers"
+        assert agent_file.parent.name == "agents"
+        # the agent loads the power BY FILE via resources (no prompt injection)
+        agent_text = agent_file.read_text("utf-8")
+        assert "resources:" in agent_text
+        assert f"file://{power_file}" in agent_text
+        # the forged agent front matter must be VALID (description quoted, etc.)
+        _assert_valid_front_matter(agent_text)
+        # the consolidated power carries the bundle's steering guidance
+        assert "guide" in power_file.read_text("utf-8")
+
+
+def test_capacitate_power_plugin_forges_file_bind():
+    from motor.capacitate import capacitate_from_repo
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        fixture = _make_power_fixture_plugin(root)
+        out = capacitate_from_repo("https://x/supa", dest=str(root / "forge"),
+                                   clone_fn=_fake_clone(fixture))
+        assert out["shape"] == "power" and out["bind"] == "file-resources"
+        assert out["manifest"] == "plugin.json"
+        assert "database" in out["keywords"]
+        assert Path(out["power_file"]).is_file()
+        # skills/*/SKILL.md folded into the consolidated power file
+        assert "setup" in Path(out["power_file"]).read_text("utf-8")
+
+
+def test_capacitate_agents_forges_file_cheap_agent():
+    from motor.capacitate import capacitate_from_repo
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        fixture = _make_agents_fixture(root)
+        out = capacitate_from_repo("https://x/my-agents", dest=str(root / "forge"),
+                                   clone_fn=_fake_clone(fixture))
+        assert out["shape"] == "agents"
+        assert out["bind"] == "file-agent"
+        artifact = Path(out["agent_file"])
+        assert artifact.is_file() and artifact.name.startswith("ephemeral-")
+        assert artifact.parent.name == "agents"
+        body = artifact.read_text("utf-8")
+        assert body.startswith("---") and "name: ephemeral-" in body
+        assert "You write code." in body  # persona carried over IN the file
+
+
+def test_capacitate_code_refuses_cleanly():
+    from motor.capacitate import capacitate_from_repo
+    from motor.errors import CapacitateError
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        fixture = _make_code_fixture(root)
+        try:
+            capacitate_from_repo("https://x/cool-lib", dest=str(root / "forge"),
+                                 clone_fn=_fake_clone(fixture))
+            raise AssertionError("expected CapacitateError (code shape refused)")
+        except CapacitateError as exc:
+            assert "out of scope" in str(exc).lower()
+
+
+def test_capacitate_dry_run_writes_nothing():
+    from motor.capacitate import capacitate_from_repo
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        fixture = _make_power_fixture_legacy(root)
+        out = capacitate_from_repo("https://x/design-thing", dest=str(root / "forge"),
+                                   dry_run=True, clone_fn=_fake_clone(fixture))
+        assert out["dry_run"] is True
+        assert not Path(out["power_file"]).exists()  # nothing written
+        assert not Path(out["agent_file"]).exists()
+
+
+def test_capacitate_empty_repo_raises_clean():
+    from motor.capacitate import capacitate_from_repo
+    from motor.errors import CapacitateError
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+
+        def _clone_empty(_u, dest, _b):
+            dest.mkdir(parents=True)  # produce an EMPTY clone
+
+        try:
+            capacitate_from_repo("https://x/empty", dest=str(root / "forge"),
+                                 clone_fn=_clone_empty)
+            raise AssertionError("expected CapacitateError")
+        except CapacitateError:
+            pass
+
+
+def test_capacitate_bad_url_raises_clean():
+    from motor.capacitate import capacitate_from_repo
+    from motor.errors import CapacitateError
+    try:
+        capacitate_from_repo("")
+        raise AssertionError("expected CapacitateError")
+    except CapacitateError:
+        pass
+
+
+def test_capacitate_journey_places_under_journey_artifacts():
+    """--journey routes forged ephemerals to journeys/<id>/artifacts/.kiro/…"""
+    import os as _os
+    from motor.capacitate import capacitate_from_repo
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        fixture = _make_power_fixture_legacy(root)
+        prev = _os.environ.get("TMUX_MAINBRAIN_JOURNEYS")
+        _os.environ["TMUX_MAINBRAIN_JOURNEYS"] = str(root / "journeys")
+        try:
+            out = capacitate_from_repo("https://x/design-thing",
+                                       journey="journey-test",
+                                       clone_fn=_fake_clone(fixture))
+        finally:
+            if prev is None:
+                _os.environ.pop("TMUX_MAINBRAIN_JOURNEYS", None)
+            else:
+                _os.environ["TMUX_MAINBRAIN_JOURNEYS"] = prev
+        agent_file = Path(out["agent_file"])
+        power_file = Path(out["power_file"])
+        # both land under journeys/journey-test/artifacts/.kiro/…
+        assert "journey-test" in agent_file.parts
+        assert agent_file.parts[-3:] == (".kiro", "agents",
+                                         "ephemeral-design-thing.md")
+        assert power_file.parts[-3:] == (".kiro", "powers",
+                                         "ephemeral-power-design-thing.md")
+        assert "artifacts" in agent_file.parts
+        # the cheap file bind points at the power's journey path
+        assert f"file://{power_file}" in agent_file.read_text("utf-8")
+        # the scratch clone stays OUT of the journey (in .cap-forge)
+        assert "journey-test" not in out["cloned_to"]
+
+
+# --------------------------------------------------------------------------- #
 # read_turns (content companion to read_session)
 # --------------------------------------------------------------------------- #
 def _make_v3_turns(root: Path, sid: str) -> None:
@@ -597,6 +884,616 @@ def test_read_turns_missing_session_raises():
             raise AssertionError("expected SessionNotFoundError")
         except SessionNotFoundError:
             pass
+
+
+# --------------------------------------------------------------------------- #
+# read_turns --since (incremental GET) + --spill + search + read_verdict
+# --------------------------------------------------------------------------- #
+def _append_verdict_turn(root: Path, sid: str, *, marker: bool,
+                         body: str = "the verdict body\nwith two lines") -> None:
+    """Append a second full turn to the sess_rt fixture, optionally carrying a
+    FINAL VERDICT marker with a multi-line body."""
+    ws = root / "abc123hash" / sid
+    transcript = ws / "messages.jsonl"
+    speech = ("preamble that must be excluded.\n\nFINAL VERDICT\n" + body) \
+        if marker else "a plain closing answer with no marker at all"
+    extra = [
+        {"timestamp": "z0", "payload": {"type": "user", "content": "conclude"}},
+        {"timestamp": "z1", "payload": {"type": "turn_start", "executionId": "e3"}},
+        {"timestamp": "z2", "payload": {"type": "assistant", "content": speech}},
+        {"timestamp": "z3", "payload": {"type": "turn_end", "stopReason": "end"}},
+    ]
+    with transcript.open("a", encoding="utf-8") as handle:
+        for row in extra:
+            handle.write(json.dumps(row) + "\n")
+
+
+def test_read_turns_since_returns_only_delta():
+    from motor.sessions import read_turns as rt
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _make_v3_turns(root, "sess_rt")
+        first = rt("sess_rt", last=99, role="all", root=root)
+        cursor = first["cursor"]
+        assert cursor > 0
+        # Append a new turn; a --since read must return ONLY the new material.
+        _append_verdict_turn(root, "sess_rt", marker=False)
+        delta = rt("sess_rt", last=99, role="all", since=cursor, root=root)
+        texts = [t["text"] for t in delta["turns"]]
+        assert "conclude" in texts  # the new user turn
+        assert "first question" not in texts  # old turns NOT re-returned
+        assert delta["cursor"] > cursor
+
+
+def test_read_turns_spill_writes_file():
+    from motor.sessions import read_turns as rt
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _make_v3_turns(root, "sess_rt")
+        spill = Path(tmp) / "cut" / "turns.md"
+        out = rt("sess_rt", last=2, role="all", spill=str(spill), root=root)
+        assert out["spill_path"] == str(spill)
+        assert spill.exists()
+        content = spill.read_text(encoding="utf-8")
+        assert "### AGENT" in content
+        assert "Answer two" in content
+
+
+def test_read_verdict_extracts_block_intact():
+    from motor.sessions import read_verdict
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _make_v3_turns(root, "sess_rt")
+        _append_verdict_turn(root, "sess_rt", marker=True,
+                             body="line A\nline B\nline C")
+        res = read_verdict("sess_rt", timeout=0, interval=0, root=root)
+        assert res["found"] is True, res
+        # Only the block, intact (newlines preserved), preamble excluded.
+        assert res["verdict"].startswith("FINAL VERDICT")
+        assert "line A\nline B\nline C" in res["verdict"]
+        assert "preamble" not in res["verdict"]
+
+
+def test_read_verdict_timeout_reports_no_marker():
+    from motor.sessions import read_verdict
+    clock = _FakeClock()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _make_v3_turns(root, "sess_rt")
+        _append_verdict_turn(root, "sess_rt", marker=False)
+        # Advance the clock well past any growth so state == no-marker.
+        res = read_verdict("sess_rt", timeout=5, interval=1, root=root,
+                           sleep_fn=clock.sleep, now_fn=clock.now)
+        assert res["found"] is False
+        assert res["state"] in ("no-marker", "in-progress")
+        assert res["tail"]  # a tail is offered for the nudge decision
+
+
+def test_read_verdict_picks_last_marker_when_repeated():
+    from motor.sessions import read_verdict
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _make_v3_turns(root, "sess_rt")
+        # Two verdict turns: read_verdict must return the LAST one.
+        _append_verdict_turn(root, "sess_rt", marker=True, body="OLD")
+        _append_verdict_turn(root, "sess_rt", marker=True, body="NEW")
+        res = read_verdict("sess_rt", timeout=0, interval=0, root=root)
+        assert res["found"] is True
+        assert "NEW" in res["verdict"] and "OLD" not in res["verdict"]
+
+
+def test_search_turns_finds_across_sessions():
+    from motor.sessions import search_turns
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "sessions"
+        _make_v3_turns(root, "sess_a")
+        _make_v1v2(root, "leg1", state=True, fresh=True)  # has "hi there"
+        hits = search_turns("hi there", root=root)
+        assert hits["count"] >= 1
+        assert any(m["session_id"] == "leg1" for m in hits["matches"])
+        snip = hits["matches"][0]["snippet"]
+        assert "hi there" in snip
+
+
+def test_search_turns_role_filter_and_case():
+    from motor.sessions import search_turns
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "sessions"
+        _make_v3_turns(root, "sess_a")
+        # 'Answer two' is an assistant turn; user filter must NOT match it.
+        assert search_turns("Answer two", role="user", root=root)["count"] == 0
+        assert search_turns("Answer two", role="assistant", root=root)["count"] == 1
+        # case-insensitive by default
+        assert search_turns("answer TWO", root=root)["count"] == 1
+
+
+def test_read_turns_since_empty_when_no_new_data():
+    from motor.sessions import read_turns as rt
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _make_v3_turns(root, "sess_rt")
+        first = rt("sess_rt", last=99, role="all", root=root)
+        again = rt("sess_rt", last=99, role="all", since=first["cursor"],
+                   root=root)
+        assert again["count"] == 0  # nothing appended => no delta
+        assert again["cursor"] == first["cursor"]
+
+
+# --------------------------------------------------------------------------- #
+# lineage — automatic parent-edge recording into journeys/<id>/meta.json
+# --------------------------------------------------------------------------- #
+_ROOT_SID = "sess_root_king"
+
+
+def _make_journey_meta(journeys_root: Path, journey_id: str,
+                       knights: list) -> Path:
+    """Write a journey meta.json shaped like the real one (tree_root L1 +
+    parenting_rule + tui + knights[]). Returns the meta.json path."""
+    jdir = journeys_root / journey_id
+    jdir.mkdir(parents=True, exist_ok=True)
+    doc = {
+        "journey_id": journey_id,
+        "tui": "ENABLED",
+        "goal": "test journey",
+        "parenting_rule": "parent = who COMMANDS this knight (the requester).",
+        "tree_root": {"role": "king", "level": 1, "session_id": _ROOT_SID},
+        "knights": knights,
+    }
+    meta = jdir / "meta.json"
+    meta.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+    return meta
+
+
+def _l2_knight(sid: str, *, role: str = "archmaester",
+               agent: str = "archmaester") -> dict:
+    return {"role": role, "agent": agent, "session_id": sid,
+            "tmux_session": f"{role}-tui", "parent": _ROOT_SID, "level": 2,
+            "resolved": True, "note": "seed L2 knight"}
+
+
+def test_lineage_records_child_of_tree_root_at_level_2():
+    from motor.lineage import record_lineage
+    with tempfile.TemporaryDirectory() as tmp:
+        journeys = Path(tmp) / "journeys"
+        meta = _make_journey_meta(journeys, "j", knights=[])
+        prev = os.environ.get("TMUX_MAINBRAIN_JOURNEYS")
+        os.environ["TMUX_MAINBRAIN_JOURNEYS"] = str(journeys)
+        try:
+            recorded, warning = record_lineage(
+                "j", "sess_child", "child-tui", "some-agent",
+                parent_session_id=_ROOT_SID)
+        finally:
+            if prev is None:
+                os.environ.pop("TMUX_MAINBRAIN_JOURNEYS", None)
+            else:
+                os.environ["TMUX_MAINBRAIN_JOURNEYS"] = prev
+        assert recorded is True and warning is None
+        doc = json.loads(meta.read_text())
+        # tree_root, parenting_rule, tui preserved verbatim.
+        assert doc["tree_root"]["session_id"] == _ROOT_SID
+        assert doc["parenting_rule"].startswith("parent = who COMMANDS")
+        assert doc["tui"] == "ENABLED"
+        knight = next(k for k in doc["knights"] if k["session_id"] == "sess_child")
+        assert knight["parent"] == _ROOT_SID
+        assert knight["level"] == 2  # child of the L1 root
+        assert knight["role"] == "some-agent"  # role defaults to agent name
+        assert knight["tmux_session"] == "child-tui"
+        assert knight["resolved"] is True
+        assert "spawned via motor --parent" in knight["note"]
+
+
+def test_lineage_records_L3_child_of_existing_L2_knight():
+    """THE L3 CASE: parent is an existing level-2 knight => child level 3."""
+    from motor.lineage import record_lineage
+    with tempfile.TemporaryDirectory() as tmp:
+        journeys = Path(tmp) / "journeys"
+        seed = _l2_knight("sess_arch", role="archmaester", agent="archmaester")
+        meta = _make_journey_meta(journeys, "j", knights=[seed])
+        prev = os.environ.get("TMUX_MAINBRAIN_JOURNEYS")
+        os.environ["TMUX_MAINBRAIN_JOURNEYS"] = str(journeys)
+        try:
+            recorded, warning = record_lineage(
+                "j", "sess_subknight", "sub-tui", "sub-agent",
+                parent_session_id="sess_arch", role="sub-knight")
+        finally:
+            if prev is None:
+                os.environ.pop("TMUX_MAINBRAIN_JOURNEYS", None)
+            else:
+                os.environ["TMUX_MAINBRAIN_JOURNEYS"] = prev
+        assert recorded is True and warning is None
+        doc = json.loads(meta.read_text())
+        # The seed L2 knight is untouched.
+        arch = next(k for k in doc["knights"] if k["session_id"] == "sess_arch")
+        assert arch["level"] == 2 and arch["note"] == "seed L2 knight"
+        child = next(k for k in doc["knights"]
+                     if k["session_id"] == "sess_subknight")
+        assert child["parent"] == "sess_arch"
+        assert child["level"] == 3  # <-- the whole point
+        assert child["role"] == "sub-knight"
+
+
+def test_lineage_parent_not_found_records_null_level_with_warning():
+    from motor.lineage import record_lineage
+    with tempfile.TemporaryDirectory() as tmp:
+        journeys = Path(tmp) / "journeys"
+        meta = _make_journey_meta(journeys, "j", knights=[])
+        prev = os.environ.get("TMUX_MAINBRAIN_JOURNEYS")
+        os.environ["TMUX_MAINBRAIN_JOURNEYS"] = str(journeys)
+        try:
+            recorded, warning = record_lineage(
+                "j", "sess_orphan", "orphan-tui", "orphan-agent",
+                parent_session_id="sess_ghost")
+        finally:
+            if prev is None:
+                os.environ.pop("TMUX_MAINBRAIN_JOURNEYS", None)
+            else:
+                os.environ["TMUX_MAINBRAIN_JOURNEYS"] = prev
+        # Recorded (True) with a warning; level is null, parent still set.
+        assert recorded is True
+        assert warning is not None and "not found" in warning
+        doc = json.loads(meta.read_text())
+        knight = next(k for k in doc["knights"]
+                      if k["session_id"] == "sess_orphan")
+        assert knight["parent"] == "sess_ghost"
+        assert knight["level"] is None  # NOT invented
+        assert "level=null" in knight["note"]
+
+
+def test_lineage_missing_journey_meta_fails_soft():
+    from motor.lineage import record_lineage
+    with tempfile.TemporaryDirectory() as tmp:
+        journeys = Path(tmp) / "journeys"  # no journey dir/meta at all
+        prev = os.environ.get("TMUX_MAINBRAIN_JOURNEYS")
+        os.environ["TMUX_MAINBRAIN_JOURNEYS"] = str(journeys)
+        try:
+            recorded, warning = record_lineage(
+                "j-absent", "sess_x", "x-tui", "x-agent",
+                parent_session_id=_ROOT_SID)
+        finally:
+            if prev is None:
+                os.environ.pop("TMUX_MAINBRAIN_JOURNEYS", None)
+            else:
+                os.environ["TMUX_MAINBRAIN_JOURNEYS"] = prev
+        assert recorded is False
+        assert warning is not None and "unreadable" in warning
+
+
+def test_lineage_corrupt_journey_meta_fails_soft():
+    from motor.lineage import record_lineage
+    with tempfile.TemporaryDirectory() as tmp:
+        journeys = Path(tmp) / "journeys"
+        jdir = journeys / "j"
+        jdir.mkdir(parents=True)
+        (jdir / "meta.json").write_text("{ not valid json ]", encoding="utf-8")
+        prev = os.environ.get("TMUX_MAINBRAIN_JOURNEYS")
+        os.environ["TMUX_MAINBRAIN_JOURNEYS"] = str(journeys)
+        try:
+            recorded, warning = record_lineage(
+                "j", "sess_x", "x-tui", "x-agent",
+                parent_session_id=_ROOT_SID)
+        finally:
+            if prev is None:
+                os.environ.pop("TMUX_MAINBRAIN_JOURNEYS", None)
+            else:
+                os.environ["TMUX_MAINBRAIN_JOURNEYS"] = prev
+        assert recorded is False
+        assert warning is not None and "unparseable" in warning
+
+
+def test_lineage_idempotent_update_not_duplicate():
+    from motor.lineage import record_lineage
+    with tempfile.TemporaryDirectory() as tmp:
+        journeys = Path(tmp) / "journeys"
+        meta = _make_journey_meta(journeys, "j", knights=[])
+        prev = os.environ.get("TMUX_MAINBRAIN_JOURNEYS")
+        os.environ["TMUX_MAINBRAIN_JOURNEYS"] = str(journeys)
+        try:
+            record_lineage("j", "sess_dup", "old-tui", "old-agent",
+                           parent_session_id=_ROOT_SID)
+            # Same session_id again with new pointer fields.
+            recorded, _ = record_lineage("j", "sess_dup", "new-tui", "new-agent",
+                                         parent_session_id=_ROOT_SID,
+                                         role="updated-role")
+        finally:
+            if prev is None:
+                os.environ.pop("TMUX_MAINBRAIN_JOURNEYS", None)
+            else:
+                os.environ["TMUX_MAINBRAIN_JOURNEYS"] = prev
+        assert recorded is True
+        doc = json.loads(meta.read_text())
+        dups = [k for k in doc["knights"] if k["session_id"] == "sess_dup"]
+        assert len(dups) == 1  # updated, not duplicated
+        assert dups[0]["tmux_session"] == "new-tui"
+        assert dups[0]["agent"] == "new-agent"
+        assert dups[0]["role"] == "updated-role"
+
+
+# --- spawn/resume lineage folding (stubbed tmux — never a real session) ----- #
+def _stub_tmux_spawn(monkeypatch_target, resolved_sid):
+    """Neutralize the real tmux/kiro seams in tmux_driver so spawn/resume run
+    their lineage logic WITHOUT touching tmux. Returns a restore callable."""
+    td = monkeypatch_target
+    saved = {
+        "_session_exists": td._session_exists,
+        "_tmux": td._tmux,
+        "_wait_until_ready": td._wait_until_ready,
+        "_resolve_new_session_id": td._resolve_new_session_id,
+        "_secret_env_flags": td._secret_env_flags,
+        "_snapshot_session_ids": td._snapshot_session_ids,
+    }
+    td._session_exists = lambda _name: False
+    td._tmux = lambda *a, **k: ""
+    td._wait_until_ready = lambda *a, **k: None
+    td._secret_env_flags = lambda: []
+    td._snapshot_session_ids = lambda *a, **k: set()
+    td._resolve_new_session_id = lambda *a, **k: resolved_sid
+
+    def _restore():
+        for name, fn in saved.items():
+            setattr(td, name, fn)
+    return _restore
+
+
+def test_spawn_backward_compat_no_lineage_args():
+    from motor import tmux_driver as td
+    with tempfile.TemporaryDirectory() as tmp:
+        restore = _stub_tmux_spawn(td, "sess_new")
+        try:
+            res = td.spawn("some-agent", tmux_session="t", cwd=tmp)
+        finally:
+            restore()
+        # Unchanged shape + the always-present flag; NO warning, NO meta write.
+        assert res["session_id"] == "sess_new"
+        assert res["resolved"] is True
+        assert res["lineage_recorded"] is False
+        assert "lineage_warning" not in res
+
+
+def test_spawn_with_parent_and_journey_records_l2(monkeypatch=None):
+    from motor import tmux_driver as td
+    with tempfile.TemporaryDirectory() as tmp:
+        journeys = Path(tmp) / "journeys"
+        meta = _make_journey_meta(journeys, "j", knights=[])
+        prev = os.environ.get("TMUX_MAINBRAIN_JOURNEYS")
+        os.environ["TMUX_MAINBRAIN_JOURNEYS"] = str(journeys)
+        restore = _stub_tmux_spawn(td, "sess_new")
+        try:
+            res = td.spawn("child-agent", tmux_session="child-tui", cwd=tmp,
+                           parent=_ROOT_SID, journey="j", role="child")
+        finally:
+            restore()
+            if prev is None:
+                os.environ.pop("TMUX_MAINBRAIN_JOURNEYS", None)
+            else:
+                os.environ["TMUX_MAINBRAIN_JOURNEYS"] = prev
+        assert res["lineage_recorded"] is True
+        assert "lineage_warning" not in res
+        doc = json.loads(meta.read_text())
+        knight = next(k for k in doc["knights"] if k["session_id"] == "sess_new")
+        assert knight["parent"] == _ROOT_SID and knight["level"] == 2
+        assert knight["role"] == "child"
+
+
+def test_spawn_unresolved_session_id_reports_lineage_warning():
+    from motor import tmux_driver as td
+    with tempfile.TemporaryDirectory() as tmp:
+        journeys = Path(tmp) / "journeys"
+        _make_journey_meta(journeys, "j", knights=[])
+        prev = os.environ.get("TMUX_MAINBRAIN_JOURNEYS")
+        os.environ["TMUX_MAINBRAIN_JOURNEYS"] = str(journeys)
+        restore = _stub_tmux_spawn(td, None)  # id NOT resolved
+        try:
+            res = td.spawn("child-agent", tmux_session="child-tui", cwd=tmp,
+                           parent=_ROOT_SID, journey="j")
+        finally:
+            restore()
+            if prev is None:
+                os.environ.pop("TMUX_MAINBRAIN_JOURNEYS", None)
+            else:
+                os.environ["TMUX_MAINBRAIN_JOURNEYS"] = prev
+        assert res["resolved"] is False
+        assert res["lineage_recorded"] is False
+        assert "unresolved" in res["lineage_warning"]
+
+
+def test_spawn_only_parent_without_journey_warns_records_nothing():
+    from motor import tmux_driver as td
+    with tempfile.TemporaryDirectory() as tmp:
+        restore = _stub_tmux_spawn(td, "sess_new")
+        try:
+            res = td.spawn("child-agent", tmux_session="t", cwd=tmp,
+                           parent=_ROOT_SID)  # no --journey
+        finally:
+            restore()
+        assert res["lineage_recorded"] is False
+        assert "journey" in res["lineage_warning"]
+
+
+def test_resume_with_parent_and_journey_records():
+    from motor import tmux_driver as td
+    with tempfile.TemporaryDirectory() as tmp:
+        journeys = Path(tmp) / "journeys"
+        seed = _l2_knight("sess_arch")
+        meta = _make_journey_meta(journeys, "j", knights=[seed])
+        prev = os.environ.get("TMUX_MAINBRAIN_JOURNEYS")
+        os.environ["TMUX_MAINBRAIN_JOURNEYS"] = str(journeys)
+        restore = _stub_tmux_spawn(td, "ignored-for-resume")
+        try:
+            # resume records under the resumed knight's OWN id (kiro_session_id).
+            res = td.resume("sess_resumed", tmux_session="r-tui", cwd=tmp,
+                            parent="sess_arch", journey="j", role="sub",
+                            agent="sub-agent")
+        finally:
+            restore()
+            if prev is None:
+                os.environ.pop("TMUX_MAINBRAIN_JOURNEYS", None)
+            else:
+                os.environ["TMUX_MAINBRAIN_JOURNEYS"] = prev
+        assert res["lineage_recorded"] is True
+        doc = json.loads(meta.read_text())
+        knight = next(k for k in doc["knights"]
+                      if k["session_id"] == "sess_resumed")
+        assert knight["parent"] == "sess_arch" and knight["level"] == 3
+
+
+# --------------------------------------------------------------------------- #
+# resume_clean — stale-lock-aware resume (kiro has no native lock/force flag)
+# --------------------------------------------------------------------------- #
+def _make_v3_with_lock(root: Path, sid: str, *, lock: str = None) -> Path:
+    """Build a v3 session dir (first-turn so it resolves), optionally with a
+    ``.lock`` whose raw content is ``lock`` (a JSON string, or None => no lock).
+    Returns the session dir."""
+    _make_v3(root, sid, first_turn=True, fresh=True)
+    ws = root / "abc123hash" / sid
+    if lock is not None:
+        (ws / ".lock").write_text(lock, encoding="utf-8")
+    return ws
+
+
+def test_resume_clean_lock_absent_resumes_normally():
+    from motor import tmux_driver as td
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "sessions"
+        _make_v3_with_lock(root, "sess_nolock", lock=None)  # no .lock
+        restore = _stub_tmux_spawn(td, "ignored")
+        try:
+            res = td.resume_clean("sess_nolock", tmux_session="rc", cwd=tmp,
+                                  root=root,
+                                  pid_alive_fn=lambda _pid: True)  # never consulted
+        finally:
+            restore()
+        assert res["resumed"] is True
+        assert res["removed_stale_lock"] is False
+        assert res["tmux_session"] == "rc"
+        assert res["session_id"] == "sess_nolock"
+
+
+def test_resume_clean_dead_pid_removes_lock_and_resumes():
+    from motor import tmux_driver as td
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "sessions"
+        ws = _make_v3_with_lock(root, "sess_dead",
+                                lock=json.dumps({"pid": 424242,
+                                                 "started_at": "t"}))
+        lock_path = ws / ".lock"
+        assert lock_path.exists()
+        restore = _stub_tmux_spawn(td, "ignored")
+        try:
+            res = td.resume_clean("sess_dead", tmux_session="rc", cwd=tmp,
+                                  root=root,
+                                  pid_alive_fn=lambda _pid: False)  # DEAD
+        finally:
+            restore()
+        assert res["resumed"] is True
+        assert res["removed_stale_lock"] is True
+        assert res["pid"] == 424242
+        assert not lock_path.exists()  # stale lock cleared
+
+
+def test_resume_clean_alive_pid_refuses_and_keeps_lock():
+    from motor import tmux_driver as td
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "sessions"
+        ws = _make_v3_with_lock(root, "sess_live",
+                                lock=json.dumps({"pid": 1927179}))
+        lock_path = ws / ".lock"
+        # If resume were (wrongly) attempted, the tmux seam would be hit; assert
+        # it is NOT by making _tmux raise if called.
+        def _boom(*_a, **_k):
+            raise AssertionError("resume must NOT be attempted for a live lock")
+        saved_tmux = td._tmux
+        td._tmux = _boom
+        try:
+            res = td.resume_clean("sess_live", tmux_session="rc", cwd=tmp,
+                                  root=root,
+                                  pid_alive_fn=lambda _pid: True)  # ALIVE
+        finally:
+            td._tmux = saved_tmux
+        assert res["resumed"] is False
+        assert res["reason"] == "held_by_live"
+        assert res["pid"] == 1927179
+        assert res["tmux_session"] is None
+        assert res["removed_stale_lock"] is False
+        assert lock_path.exists()  # NEVER removed
+
+
+def test_resume_clean_unparseable_pid_refuses_unknown_lock():
+    from motor import tmux_driver as td
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "sessions"
+        ws = _make_v3_with_lock(root, "sess_junk", lock="{ not json ]")
+        lock_path = ws / ".lock"
+        restore = _stub_tmux_spawn(td, "ignored")
+        try:
+            res = td.resume_clean("sess_junk", tmux_session="rc", cwd=tmp,
+                                  root=root,
+                                  pid_alive_fn=lambda _pid: False)
+        finally:
+            restore()
+        assert res["resumed"] is False
+        assert res["reason"] == "unknown_lock"
+        assert res["tmux_session"] is None
+        assert res["removed_stale_lock"] is False
+        assert lock_path.exists()  # NOT removed (safer to refuse than guess)
+
+
+def test_resume_clean_dead_pid_with_lineage_records():
+    from motor import tmux_driver as td
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "sessions"
+        _make_v3_with_lock(root, "sess_dead2",
+                           lock=json.dumps({"pid": 999999}))
+        journeys = Path(tmp) / "journeys"
+        seed = _l2_knight("sess_arch")
+        meta = _make_journey_meta(journeys, "j", knights=[seed])
+        prev = os.environ.get("TMUX_MAINBRAIN_JOURNEYS")
+        os.environ["TMUX_MAINBRAIN_JOURNEYS"] = str(journeys)
+        restore = _stub_tmux_spawn(td, "ignored")
+        try:
+            res = td.resume_clean("sess_dead2", tmux_session="rc", cwd=tmp,
+                                  root=root, parent="sess_arch", journey="j",
+                                  role="sub", agent="sub-agent",
+                                  pid_alive_fn=lambda _pid: False)
+        finally:
+            restore()
+            if prev is None:
+                os.environ.pop("TMUX_MAINBRAIN_JOURNEYS", None)
+            else:
+                os.environ["TMUX_MAINBRAIN_JOURNEYS"] = prev
+        assert res["resumed"] is True
+        assert res["removed_stale_lock"] is True
+        assert res["lineage_recorded"] is True
+        doc = json.loads(meta.read_text())
+        knight = next(k for k in doc["knights"]
+                      if k["session_id"] == "sess_dead2")
+        # child of the L2 archmaester => level 3, parent set.
+        assert knight["parent"] == "sess_arch" and knight["level"] == 3
+
+
+def test_resume_clean_missing_session_dir_fails_soft():
+    from motor import tmux_driver as td
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "sessions"  # empty; session does not exist
+        restore = _stub_tmux_spawn(td, "ignored")
+        try:
+            res = td.resume_clean("sess_absent", tmux_session="rc", cwd=tmp,
+                                  root=root,
+                                  pid_alive_fn=lambda _pid: False)
+        finally:
+            restore()
+        # Fail-soft: clear reason, no exception, no resume.
+        assert res["resumed"] is False
+        assert res["reason"] == "session_not_found"
+        assert res["tmux_session"] is None
+        assert res["removed_stale_lock"] is False
+
+
+def test_resume_clean_default_pid_probe_reads_proc():
+    """The default pid-liveness seam probes /proc; a nonexistent pid is dead."""
+    from motor.lockcheck import default_pid_alive
+    # PID 1 (init) is always alive on Linux; a huge pid is not present.
+    assert default_pid_alive(1) is True
+    assert default_pid_alive(2_147_480_000) is False
 
 
 # --------------------------------------------------------------------------- #

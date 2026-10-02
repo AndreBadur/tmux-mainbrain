@@ -17,6 +17,7 @@ See each module docstring for the POC it implements.
 from __future__ import annotations
 
 from .errors import (
+    CapacitateError,
     DeliveryError,
     MiningError,
     MotorError,
@@ -26,11 +27,13 @@ from .errors import (
     TmuxTimeoutError,
     UnknownSessionFormatError,
 )
+from .capacitate import capacitate_from_repo, detect_shape
 from .format_adapter import read_session, read_session_path
 from .knight_model import Knight, Liveness, SessionFormat
+from .lineage import record_lineage
 from .mining import mine
-from .sessions import context_of, read_turns, scan_knights
-from .tmux_driver import deliver, peek, resume, spawn, watch
+from .sessions import context_of, read_turns, read_verdict, scan_knights, search_turns
+from .tmux_driver import deliver, peek, resume, resume_clean, spawn, watch
 
 __all__ = [
     # session reading (POCs 03/04/06/07)
@@ -39,14 +42,22 @@ __all__ = [
     "scan_knights",
     "context_of",
     "read_turns",
+    "read_verdict",
+    "search_turns",
     # tmux runtime (POCs 02/08)
     "spawn",
     "resume",
+    "resume_clean",
     "deliver",
     "watch",
     "peek",
     # mining (POC 03 + MemPalace)
     "mine",
+    # lineage (parent-edge recording for the subagent cascade tree)
+    "record_lineage",
+    # capacitation (repo URL -> knight capability)
+    "capacitate_from_repo",
+    "detect_shape",
     # model + errors
     "Knight",
     "Liveness",
@@ -59,6 +70,7 @@ __all__ = [
     "TmuxTimeoutError",
     "DeliveryError",
     "MiningError",
+    "CapacitateError",
 ]
 
 __version__ = "1.0.0"

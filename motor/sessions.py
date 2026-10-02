@@ -14,11 +14,17 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from .errors import MotorError, SessionCorruptError, UnknownSessionFormatError
+from .errors import (
+    MotorError,
+    SessionCorruptError,
+    SessionNotFoundError,
+    UnknownSessionFormatError,
+)
 from .format_adapter import read_session, read_session_path
 from .knight_model import Knight, SessionFormat
 from .paths import sessions_root, steward_index_path
@@ -158,6 +164,8 @@ def context_of(session_id: str, root: Optional[Path] = None) -> dict[str, Any]:
 def read_turns(session_id: str,
                last: int = 1,
                role: str = "assistant",
+               since: Optional[int] = None,
+               spill: Optional[str] = None,
                root: Optional[Path] = None) -> dict[str, Any]:
     """Return the last ``last`` conversational TURNS of a session, text-only.
 
@@ -183,11 +191,21 @@ def read_turns(session_id: str,
         session_id: bare uuid (v1/v2) or ``sess_<uuid>`` / uuid (v3).
         last: number of turns to return (of the filtered role). Default 1.
         role: 'assistant' (default), 'user', or 'all'.
+        since: incremental GET cursor — a BYTE OFFSET into the transcript
+               previously returned as ``cursor``. When given, only rows AFTER
+               that offset are parsed, so the caller GETs only the delta since
+               its last read (no re-reading the whole transcript). ``last`` then
+               slices within that delta. None (default) = read from the start.
+        spill: optional path — write the SELECTED turns to this file (one clean
+               ``### ROLE`` block per turn) instead of only returning them in
+               memory. Used to extract cut turns for ephemeral-agent creation.
         root: sessions root override (tests); defaults to ``sessions_root()``.
 
     Returns:
-        {session_id, count, turns:[{role, text, ts}]} — turns in chronological
-        order (oldest of the returned slice first).
+        {session_id, count, turns:[{role, text, ts}], cursor} — turns in
+        chronological order (oldest of the returned slice first). ``cursor`` is
+        the byte offset consumed (pass it back as ``since`` for the next delta).
+        When ``spill`` is given, also ``spill_path`` (the file written).
 
     Raises:
         ValueError: invalid ``role`` or non-positive ``last``.
@@ -199,34 +217,298 @@ def read_turns(session_id: str,
         )
     if last <= 0:
         raise ValueError("last must be a positive integer (turns to return)")
+    if since is not None and since < 0:
+        raise ValueError("since must be a non-negative byte offset")
 
     knight = read_session(session_id, root=root)
     transcript = knight.transcript_path
     if not transcript:
         # Fresh/pre-first-turn session, or a session with no transcript on disk.
-        return {"session_id": knight.session_id, "count": 0, "turns": []}
+        return {"session_id": knight.session_id, "count": 0, "turns": [],
+                "cursor": since or 0}
 
-    rows = _read_jsonl_rows(Path(transcript))
-
-    if knight.fmt == SessionFormat.V3:
-        turns = _turns_from_v3(rows)
-    elif knight.fmt == SessionFormat.V1_V2:
-        turns = _turns_from_v1v2(rows)
-    else:
-        raise UnknownSessionFormatError(
-            f"cannot read turns for session '{knight.session_id}': "
-            f"unknown format {knight.fmt}"
-        )
+    rows, cursor = _read_jsonl_rows_from(Path(transcript), since or 0)
+    turns = _reconstruct_turns(knight.fmt, rows, knight.session_id)
 
     if role != "all":
         turns = [t for t in turns if t["role"] == role]
 
     selected = turns[-last:] if last < len(turns) else turns
-    return {
+    result: dict[str, Any] = {
         "session_id": knight.session_id,
         "count": len(selected),
         "turns": selected,
+        "cursor": cursor,
     }
+    if spill is not None:
+        result["spill_path"] = _spill_turns(Path(spill), knight.session_id,
+                                             selected)
+    return result
+
+
+_VERDICT_MARKER = "FINAL VERDICT"
+# Bounded defaults for the read_verdict poll loop (never hang forever).
+_VERDICT_TIMEOUT = 120.0
+_VERDICT_INTERVAL = 2.0
+
+
+def _reconstruct_turns(fmt: Optional[SessionFormat],
+                       rows: list[dict[str, Any]],
+                       session_id: str) -> list[dict[str, Any]]:
+    """Dispatch to the format-specific turn reconstruction (shared core).
+
+    The single place both ``read_turns`` and ``read_verdict`` go through so the
+    clean-turn logic is never duplicated (reuse, not rewrite).
+    """
+    if fmt == SessionFormat.V3:
+        return _turns_from_v3(rows)
+    if fmt == SessionFormat.V1_V2:
+        return _turns_from_v1v2(rows)
+    raise UnknownSessionFormatError(
+        f"cannot read turns for session '{session_id}': unknown format {fmt}"
+    )
+
+
+def _extract_verdict(text: str) -> Optional[str]:
+    """Return the text from the LAST ``FINAL VERDICT`` marker to end, intact.
+
+    Preserves the block's internal newlines/structure (NOT flattened). Returns
+    None when the marker is absent. The marker line itself is included so the
+    caller sees the delimiter it agreed on.
+    """
+    idx = text.rfind(_VERDICT_MARKER)
+    if idx == -1:
+        return None
+    # Rewind to the start of the marker's own line so a leading indent/prefix
+    # on that line is not spuriously dropped, but keep it clean.
+    line_start = text.rfind("\n", 0, idx) + 1
+    return text[line_start:].strip()
+
+
+def read_verdict(session_id: str,
+                 timeout: float = _VERDICT_TIMEOUT,
+                 interval: float = _VERDICT_INTERVAL,
+                 root: Optional[Path] = None,
+                 sleep_fn: Optional[Any] = None,
+                 now_fn: Optional[Any] = None) -> dict[str, Any]:
+    """Poll a session incrementally until its last assistant turn carries a
+    ``FINAL VERDICT`` block; return ONLY that block (intact, with newlines).
+
+    The GET channel for a concluding knight (never ``peek``). Reads the
+    transcript by byte-offset tail, tolerating a partial mid-write last line,
+    so it observes NEW turns as they append. On success returns the verdict
+    block verbatim from the last ``FINAL VERDICT`` marker to end-of-turn.
+
+    On timeout it does NOT guess — it reports whether the knight is still
+    producing (``state: in-progress``) or has clearly finished a turn WITHOUT
+    the marker (``state: no-marker``), plus the last turn's tail so the caller
+    (orchestrator) can decide to nudge:
+        ALWAYS INCLUDE "FINAL VERDICT" IN LAST ANSWER SCOPE.
+
+    Args:
+        session_id: the knight's session id.
+        timeout: max seconds to poll (bounded; never infinite). Default 120.
+        interval: seconds between polls. Default 2.
+        root: sessions root override (tests).
+        sleep_fn / now_fn: injectable clock seams for deterministic tests.
+
+    Returns:
+        success  -> {found: true,  session_id, verdict, turns_seen, cursor}
+        timeout  -> {found: false, session_id, state, tail, turns_seen, cursor}
+    """
+    sleeper = sleep_fn or time.sleep
+    clock = now_fn or time.monotonic
+
+    knight = read_session(session_id, root=root)
+    fmt = knight.fmt
+    sid = knight.session_id
+
+    deadline = clock() + max(timeout, 0.0)
+    offset = 0
+    rows: list[dict[str, Any]] = []
+    turns_seen = 0
+    last_offset_at_change = clock()
+
+    while True:
+        transcript = _current_transcript(session_id, root)
+        if transcript is not None:
+            new_rows, offset = _read_jsonl_rows_from(transcript, offset)
+            if new_rows:
+                rows.extend(new_rows)
+                last_offset_at_change = clock()
+            turns = _reconstruct_turns(fmt, rows, sid)
+            assistant_turns = [t for t in turns if t["role"] == "assistant"]
+            turns_seen = len(assistant_turns)
+            if assistant_turns:
+                verdict = _extract_verdict(assistant_turns[-1]["text"])
+                if verdict is not None:
+                    return {"found": True, "session_id": sid,
+                            "verdict": verdict, "turns_seen": turns_seen,
+                            "cursor": offset}
+
+        if clock() >= deadline:
+            break
+        sleeper(interval)
+
+    # Timed out. Distinguish "still working" from "finished, no marker".
+    turns = _reconstruct_turns(fmt, rows, sid)
+    assistant_turns = [t for t in turns if t["role"] == "assistant"]
+    tail = assistant_turns[-1]["text"][-400:] if assistant_turns else ""
+    # If the transcript grew within the last interval, it is likely still
+    # producing; otherwise it has settled without emitting the marker.
+    still_growing = (clock() - last_offset_at_change) < (interval * 2)
+    state = "in-progress" if still_growing else "no-marker"
+    return {"found": False, "session_id": sid, "state": state,
+            "tail": tail, "turns_seen": len(assistant_turns), "cursor": offset}
+
+
+def search_turns(query: str,
+                 role: str = "all",
+                 limit: int = 20,
+                 case_sensitive: bool = False,
+                 root: Optional[Path] = None) -> dict[str, Any]:
+    """Grep-style search THROUGH the turns of ALL sessions on disk.
+
+    Powers the Steward's "search context through old sessions": scans every
+    session under the sessions root, reconstructs its clean turns, and returns
+    the turns whose text contains ``query``. Content-level (not filename) —
+    it matches the actual speech, tool noise already excluded.
+
+    Args:
+        query: substring to find in turn text.
+        role: restrict to 'assistant' | 'user' | 'all' (default all).
+        limit: max matches to return (bounded output).
+        case_sensitive: default False (case-insensitive).
+        root: sessions root override (tests).
+
+    Returns:
+        {query, count, matches:[{session_id, agent, role, snippet, ts,
+        turn_index}]}. A corrupt/unknown session is skipped, never fatal.
+    """
+    if role not in _VALID_ROLES:
+        raise ValueError(
+            f"invalid role '{role}'; expected one of {', '.join(_VALID_ROLES)}"
+        )
+    if not query:
+        raise ValueError("query must be a non-empty string")
+
+    base = root or sessions_root()
+    needle = query if case_sensitive else query.lower()
+    matches: list[dict[str, Any]] = []
+
+    for path in _iter_session_paths(base):
+        if len(matches) >= limit:
+            break
+        try:
+            knight = read_session_path(path)
+        except (SessionCorruptError, MotorError):
+            continue  # skip a bad session; a search must not abort on one file
+        transcript = knight.transcript_path
+        if not transcript:
+            continue
+        try:
+            rows = _read_jsonl_rows(Path(transcript))
+            turns = _reconstruct_turns(knight.fmt, rows, knight.session_id)
+        except (SessionCorruptError, UnknownSessionFormatError):
+            continue
+        for turn_index, turn in enumerate(turns):
+            if role != "all" and turn["role"] != role:
+                continue
+            hay = turn["text"] if case_sensitive else turn["text"].lower()
+            pos = hay.find(needle)
+            if pos == -1:
+                continue
+            matches.append({
+                "session_id": knight.session_id,
+                "agent": knight.agent,
+                "role": turn["role"],
+                "snippet": _snippet(turn["text"], pos, len(query)),
+                "ts": turn.get("ts"),
+                "turn_index": turn_index,
+            })
+            if len(matches) >= limit:
+                break
+
+    return {"query": query, "count": len(matches), "matches": matches}
+
+
+def _snippet(text: str, pos: int, qlen: int, radius: int = 80) -> str:
+    """A short, single-line context window around a match position."""
+    start = max(0, pos - radius)
+    end = min(len(text), pos + qlen + radius)
+    fragment = text[start:end].replace("\n", " ").strip()
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(text) else ""
+    return f"{prefix}{fragment}{suffix}"
+
+
+def _spill_turns(path: Path, session_id: str,
+                 turns: list[dict[str, Any]]) -> str:
+    """Write selected turns to a file as clean ``### ROLE`` blocks. Returns path.
+
+    The extraction primitive for ephemeral-agent creation: cut turns from an
+    old session into a file that a new agent can be distilled from.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"# turns from session {session_id}", ""]
+    for turn in turns:
+        header = "### USER" if turn["role"] == "user" else (
+            "### AGENT" if turn["role"] == "assistant" else
+            f"### {turn['role'].upper()}")
+        lines.append(header)
+        lines.append(turn["text"])
+        lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return str(path)
+
+
+def _current_transcript(session_id: str, root: Optional[Path]) -> Optional[Path]:
+    """Re-resolve the transcript path each poll (a fresh session may only get
+    its ``messages.jsonl`` after the first turn starts)."""
+    try:
+        knight = read_session(session_id, root=root)
+    except (SessionNotFoundError, SessionCorruptError):
+        return None
+    tp = knight.transcript_path
+    if tp and Path(tp).exists():
+        return Path(tp)
+    return None
+
+
+def _read_jsonl_rows_from(transcript: Path,
+                          from_offset: int) -> tuple[list[dict[str, Any]], int]:
+    """Read jsonl rows starting at ``from_offset`` bytes; return (rows, cursor).
+
+    Only COMPLETE lines are parsed and only the offset PAST the last complete
+    line is returned as the new cursor — a partial trailing line (live session
+    mid-write) is left unconsumed so the next poll re-reads it whole. This is
+    the tail mechanic that makes incremental GET / verdict-polling safe.
+    """
+    try:
+        with transcript.open("rb") as handle:
+            handle.seek(from_offset)
+            data = handle.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise SessionCorruptError(
+            f"cannot read transcript {transcript}: {exc}"
+        ) from exc
+
+    last_nl = data.rfind(b"\n")
+    if last_nl == -1:
+        return [], from_offset  # no complete line yet
+    complete = data[: last_nl + 1]
+    new_offset = from_offset + len(complete)
+
+    rows: list[dict[str, Any]] = []
+    for raw in complete.split(b"\n"):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            rows.append(json.loads(raw.decode("utf-8")))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue  # tolerate a malformed line; keep scanning
+    return rows, new_offset
 
 
 def _read_jsonl_rows(transcript: Path) -> list[dict[str, Any]]:

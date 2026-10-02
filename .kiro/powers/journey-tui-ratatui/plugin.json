@@ -1,0 +1,26 @@
+{
+  "$schema": "https://kiro.dev/schemas/plugin.json",
+  "name": "journey-tui-ratatui",
+  "version": "1.0.0",
+  "description": "Build/edit the tmux-mainbrain journey-tui — a reactive Rust+Ratatui TUI that renders the subagent cascade tree and lets you click-to-watch a knight via an embedded interactive tmux attach. PROVEN skill (code-derived: ~12 features shipped, 51 tests green).",
+  "author": {
+    "name": "journey-tui (Archmaester draft, Steward forged)"
+  },
+  "keywords": [
+    "journey-tui",
+    "ratatui",
+    "tmux-mainbrain",
+    "tmux-mainbrain TUI",
+    "pty",
+    "portable-pty",
+    "vt100",
+    "cascade",
+    "tmux attach",
+    "subagent tree",
+    "motor",
+    "rust tui"
+  ],
+  "skills": [
+    "skills/journey-tui-ratatui/SKILL.md"
+  ]
+}

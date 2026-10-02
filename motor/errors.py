@@ -50,3 +50,12 @@ class DeliveryError(MotorError):
 
 class MiningError(MotorError):
     """Preprocessing or the mempalace mine subprocess failed."""
+
+
+class CapacitateError(MotorError):
+    """Cloning or classifying a repo for knight-capacitation failed.
+
+    Covers a bad/unreachable URL, a network failure, an empty repo, or a
+    filesystem error while producing the capacitation artifact. Raised so the
+    CLI emits a clean ``{"error": ...}`` JSON instead of a bare traceback.
+    """

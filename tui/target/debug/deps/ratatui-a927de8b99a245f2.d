@@ -1,0 +1,10 @@
+/home/andre-badur/tmux-mainbrain/tui/target/debug/deps/ratatui-a927de8b99a245f2.d: /home/andre-badur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ratatui-0.30.2/src/lib.rs /home/andre-badur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ratatui-0.30.2/src/prelude.rs /home/andre-badur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ratatui-0.30.2/src/widgets.rs /home/andre-badur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ratatui-0.30.2/src/widgets/stateful_widget_ref.rs /home/andre-badur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ratatui-0.30.2/src/widgets/widget_ref.rs /home/andre-badur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ratatui-0.30.2/src/init.rs
+
+/home/andre-badur/tmux-mainbrain/tui/target/debug/deps/libratatui-a927de8b99a245f2.rmeta: /home/andre-badur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ratatui-0.30.2/src/lib.rs /home/andre-badur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ratatui-0.30.2/src/prelude.rs /home/andre-badur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ratatui-0.30.2/src/widgets.rs /home/andre-badur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ratatui-0.30.2/src/widgets/stateful_widget_ref.rs /home/andre-badur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ratatui-0.30.2/src/widgets/widget_ref.rs /home/andre-badur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ratatui-0.30.2/src/init.rs
+
+/home/andre-badur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ratatui-0.30.2/src/lib.rs:
+/home/andre-badur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ratatui-0.30.2/src/prelude.rs:
+/home/andre-badur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ratatui-0.30.2/src/widgets.rs:
+/home/andre-badur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ratatui-0.30.2/src/widgets/stateful_widget_ref.rs:
+/home/andre-badur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ratatui-0.30.2/src/widgets/widget_ref.rs:
+/home/andre-badur/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ratatui-0.30.2/src/init.rs:

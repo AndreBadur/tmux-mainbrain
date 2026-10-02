@@ -1,0 +1,21 @@
+[package]
+name = "journey-tui"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Reactive TUI visualizing the tmux-mainbrain subagent cascade with click-to-watch tmux attach"
+
+[dependencies]
+# --- Locked crate matrix (pipeline.md D1/D2, crate matrix) ---
+ratatui = "0.30"        # 0.30.x — re-exports crossterm 0.29
+crossterm = "0.29"      # terminal backend + event/mouse capture
+portable-pty = "0.9"    # embedded pty for the interactive watch tab (M3)
+vt100 = "0.16"          # terminal-state parser for pty output (M3)
+
+# --- Support crates (motor JSON boundary + errors) ---
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+anyhow = "1"
+
+[profile.release]
+opt-level = 2

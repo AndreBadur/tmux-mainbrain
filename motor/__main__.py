@@ -11,15 +11,19 @@ never a bare traceback to scrape.
 
 Tools & signatures:
     read_session   <session_id>
-    read_turns     <session_id> [--last N] [--role assistant|user|all]
+    read_turns     <session_id> [--last N] [--role assistant|user|all] [--since OFFSET] [--spill PATH]
+    read_verdict   <session_id> [--timeout N] [--interval F]
+    search         <query> [--role assistant|user|all] [--limit N] [--case-sensitive]
     scan_knights   [--root DIR] [--index PATH]
     context_of     <session_id>
-    spawn          <agent> [--tmux NAME] [--cwd DIR] [--ready-timeout N]
-    resume         <kiro_session_id> [--tmux NAME] [--cwd DIR] [--ready-timeout N]
+    spawn          <agent> [--tmux NAME] [--cwd DIR] [--ready-timeout N] [--parent SID --journey ID] [--role R]
+    resume         <kiro_session_id> [--tmux NAME] [--cwd DIR] [--ready-timeout N] [--parent SID --journey ID] [--role R] [--agent A]
+    resume_clean   <kiro_session_id> [--tmux NAME] [--cwd DIR] [--ready-timeout N] [--parent SID --journey ID] [--role R] [--agent A]
     deliver        <tmux_session> --prompt TEXT | --prompt-file PATH
     watch          <tmux_session> [--timeout N] [--sentinel S] [--interval F]
     peek           <tmux_session> [--lines N]
     mine           <session_jsonl> --wing W --room R [--agent A] [--dry-run]
+    capacitate_from_repo <url> [--name N] [--dest DIR] [--journey ID] [--branch B] [--dry-run]
 """
 
 from __future__ import annotations
@@ -31,14 +35,18 @@ from pathlib import Path
 from typing import Any
 
 from . import (
+    capacitate_from_repo,
     context_of,
     deliver,
     mine,
     peek,
     read_session,
     read_turns,
+    read_verdict,
     resume,
+    resume_clean,
     scan_knights,
+    search_turns,
     spawn,
     watch,
 )
@@ -64,6 +72,27 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--role", choices=["assistant", "user", "all"],
                    default="assistant",
                    help="which interlocutor to return (default assistant)")
+    p.add_argument("--since", type=int, default=None,
+                   help="incremental GET: byte-offset cursor from a prior read; "
+                        "return only the delta after it (and a new cursor)")
+    p.add_argument("--spill",
+                   help="write the selected turns to this file (for ephemeral "
+                        "agent creation) as well as returning them")
+
+    p = sub.add_parser("read_verdict",
+                       help="poll a session until its last assistant turn "
+                            "carries a FINAL VERDICT block; return only that block")
+    p.add_argument("session_id")
+    p.add_argument("--timeout", type=float, default=120.0)
+    p.add_argument("--interval", type=float, default=2.0)
+
+    p = sub.add_parser("search",
+                       help="grep THROUGH the turns of ALL sessions on disk "
+                            "(the Steward's search-old-sessions capability)")
+    p.add_argument("query")
+    p.add_argument("--role", choices=["assistant", "user", "all"], default="all")
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--case-sensitive", action="store_true")
 
     p = sub.add_parser("scan_knights")
     p.add_argument("--root")
@@ -77,12 +106,48 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tmux")
     p.add_argument("--cwd")
     p.add_argument("--ready-timeout", type=int, default=90)
+    p.add_argument("--parent",
+                   help="session id of who COMMANDS this knight (the requester); "
+                        "with --journey, records lineage in the journey meta.json")
+    p.add_argument("--journey",
+                   help="journey id whose meta.json knights[] to update "
+                        "(requires --parent; both absent => record nothing)")
+    p.add_argument("--role",
+                   help="role label for the recorded knight (defaults to the agent name)")
 
     p = sub.add_parser("resume")
     p.add_argument("kiro_session_id")
     p.add_argument("--tmux")
     p.add_argument("--cwd")
     p.add_argument("--ready-timeout", type=int, default=90)
+    p.add_argument("--parent",
+                   help="session id of who COMMANDS this knight (the requester); "
+                        "with --journey, records lineage in the journey meta.json")
+    p.add_argument("--journey",
+                   help="journey id whose meta.json knights[] to update "
+                        "(requires --parent; both absent => record nothing)")
+    p.add_argument("--role",
+                   help="role label for the recorded knight (defaults to the agent name)")
+    p.add_argument("--agent",
+                   help="agent name metadata for the recorded lineage entry")
+
+    p = sub.add_parser("resume_clean",
+                       help="stale-lock-aware resume: clear a DEAD-owner .lock "
+                            "then resume; REFUSE if the lock owner is alive")
+    p.add_argument("kiro_session_id")
+    p.add_argument("--tmux")
+    p.add_argument("--cwd")
+    p.add_argument("--ready-timeout", type=int, default=90)
+    p.add_argument("--parent",
+                   help="session id of who COMMANDS this knight (the requester); "
+                        "with --journey, records lineage in the journey meta.json")
+    p.add_argument("--journey",
+                   help="journey id whose meta.json knights[] to update "
+                        "(requires --parent; both absent => record nothing)")
+    p.add_argument("--role",
+                   help="role label for the recorded knight (defaults to the agent name)")
+    p.add_argument("--agent",
+                   help="agent name metadata for the recorded lineage entry")
 
     p = sub.add_parser("deliver")
     p.add_argument("tmux_session")
@@ -111,6 +176,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--agent", default="motor")
     p.add_argument("--dry-run", action="store_true")
 
+    p = sub.add_parser("capacitate_from_repo",
+                       help="clone a repo URL, detect its shape (power/agents/"
+                            "code), and PRODUCE the knight-capacitation artifact")
+    p.add_argument("url")
+    p.add_argument("--name")
+    p.add_argument("--dest")
+    p.add_argument("--journey",
+                   help="journey id — forged ephemerals land under "
+                        "journeys/<id>/artifacts/.kiro/{powers,agents}")
+    p.add_argument("--branch", default="main")
+    p.add_argument("--dry-run", action="store_true")
+
     return parser
 
 
@@ -122,7 +199,16 @@ def _dispatch(args: argparse.Namespace) -> Any:
         return read_session(args.session_id).to_dict()
 
     if tool == "read_turns":
-        return read_turns(args.session_id, last=args.last, role=args.role)
+        return read_turns(args.session_id, last=args.last, role=args.role,
+                          since=args.since, spill=args.spill)
+
+    if tool == "read_verdict":
+        return read_verdict(args.session_id, timeout=args.timeout,
+                            interval=args.interval)
+
+    if tool == "search":
+        return search_turns(args.query, role=args.role, limit=args.limit,
+                            case_sensitive=args.case_sensitive)
 
     if tool == "scan_knights":
         root = Path(args.root) if args.root else None
@@ -134,11 +220,20 @@ def _dispatch(args: argparse.Namespace) -> Any:
 
     if tool == "spawn":
         return spawn(args.agent, tmux_session=args.tmux, cwd=args.cwd,
-                     ready_timeout=args.ready_timeout)
+                     ready_timeout=args.ready_timeout,
+                     parent=args.parent, journey=args.journey, role=args.role)
 
     if tool == "resume":
         return resume(args.kiro_session_id, tmux_session=args.tmux, cwd=args.cwd,
-                      ready_timeout=args.ready_timeout)
+                      ready_timeout=args.ready_timeout,
+                      parent=args.parent, journey=args.journey, role=args.role,
+                      agent=args.agent)
+
+    if tool == "resume_clean":
+        return resume_clean(args.kiro_session_id, tmux_session=args.tmux,
+                            cwd=args.cwd, ready_timeout=args.ready_timeout,
+                            parent=args.parent, journey=args.journey,
+                            role=args.role, agent=args.agent)
 
     if tool == "deliver":
         prompt = args.prompt
@@ -162,6 +257,11 @@ def _dispatch(args: argparse.Namespace) -> Any:
     if tool == "mine":
         return mine(args.session_jsonl, args.wing, args.room,
                     agent=args.agent, dry_run=args.dry_run)
+
+    if tool == "capacitate_from_repo":
+        return capacitate_from_repo(args.url, name=args.name, dest=args.dest,
+                                    journey=args.journey, branch=args.branch,
+                                    dry_run=args.dry_run)
 
     raise MotorError(f"unknown tool: {tool}")  # unreachable (argparse guards)
 

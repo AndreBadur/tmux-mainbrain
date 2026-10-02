@@ -31,7 +31,9 @@ import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
-from .errors import DeliveryError, TmuxError, TmuxTimeoutError
+from .errors import DeliveryError, TmuxError, TmuxTimeoutError, SessionNotFoundError
+from .lineage import record_lineage
+from . import lockcheck
 
 # --- pane-state indicators (POC 07/08) --------------------------------------
 _IDLE_MARKER = "ask a question or describe a task"
@@ -90,6 +92,46 @@ def _session_exists(tmux_session: str) -> bool:
         return True
     except TmuxError:
         return False
+
+
+# --------------------------------------------------------------------------- #
+# secret env injection (.env.secrets -> tmux new-session -e KEY=VAL)
+# --------------------------------------------------------------------------- #
+def _secret_env_flags() -> list[str]:
+    """Parse ``<repo>/.env.secrets`` into tmux ``-e KEY=VAL`` flags.
+
+    Null-tolerant by design: if the file is absent (a host that relies on the
+    global MCP config, or a machine that has not created it yet), returns an
+    empty list — spawn/resume proceed unchanged, NEVER crash. Lines may be
+    ``export KEY=VAL`` or ``KEY=VAL``; blanks and ``#`` comments are ignored.
+    The VALUE may itself contain ``=`` (e.g. base64 tokens / JSON) — only the
+    FIRST ``=`` splits key from value. These flags load the secrets into the
+    kiro-cli child environment so the nexus plugins' ``os.environ.get(...)`` can
+    read them when no mcp.json ``env`` block supplies the key.
+    """
+    from .paths import repo_root  # lazy import: avoid load-time cycle
+
+    env_path = repo_root() / ".env.secrets"
+    try:
+        raw = env_path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return []  # fallback file absent -> no-op, deterministic
+
+    flags: list[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[len("export "):].strip()
+        if "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        flags.extend(["-e", f"{key}={value}"])
+    return flags
 
 
 # --------------------------------------------------------------------------- #
@@ -187,7 +229,10 @@ def deliver(tmux_session: str, prompt: str, require_ready: bool = True) -> None:
 def spawn(agent: str,
           tmux_session: Optional[str] = None,
           cwd: Optional[str] = None,
-          ready_timeout: int = _SPAWN_READY_TIMEOUT) -> dict[str, object]:
+          ready_timeout: int = _SPAWN_READY_TIMEOUT,
+          parent: Optional[str] = None,
+          journey: Optional[str] = None,
+          role: Optional[str] = None) -> dict[str, object]:
     """Create a detached tmux session running ``kiro-cli --v3 chat --agent X``.
 
     review iter-1 (C3 MAJOR): the session-id snapshot is SCOPED to the spawn's
@@ -197,7 +242,17 @@ def spawn(agent: str,
     is EXPLICIT: ``{session_id: None, resolved: False}`` — never a silent "".
     The Steward must then resolve via ``scan_knights`` before trusting the id.
 
-    Returns {tmux_session, agent, session_id, resolved}.
+    Lineage (optional, backward-compatible): when BOTH ``parent`` (the
+    COMMANDING knight's session id) and ``journey`` are given AND the spawn
+    resolves a session id, the new knight is appended/updated in that journey's
+    ``meta.json`` ``knights[]`` with ``parent`` set and ``level`` = parent level
+    + 1 (see :func:`motor.lineage.record_lineage`). This is FAIL-SOFT — a
+    missing/corrupt journey file never fails the spawn; the result carries
+    ``lineage_recorded`` (bool) and, when False, ``lineage_warning``. When the
+    args are absent the spawn behaves EXACTLY as before (nothing recorded).
+
+    Returns {tmux_session, agent, session_id, resolved, lineage_recorded[,
+    lineage_warning]}.
     """
     if not agent or not agent.strip():
         raise ValueError("agent must be a non-empty string")
@@ -212,7 +267,7 @@ def spawn(agent: str,
     launch = f"kiro-cli --v3 chat --agent {agent}"
 
     _tmux("new-session", "-d", "-s", session_name, "-x", "220", "-y", "50", "-c",
-          work_dir, launch)
+          work_dir, *_secret_env_flags(), launch)
     _wait_until_ready(session_name, ready_timeout)
 
     session_id = _resolve_new_session_id(
@@ -220,12 +275,14 @@ def spawn(agent: str,
         timeout=_SESSION_ID_TIMEOUT,
         list_ids_fn=lambda: _snapshot_session_ids(workspace_hash),
     )
-    return {
+    result: dict[str, object] = {
         "tmux_session": session_name,
         "agent": agent,
         "session_id": session_id,             # None when unresolved (not "")
         "resolved": session_id is not None,
     }
+    _apply_lineage(result, session_id, session_name, agent, parent, journey, role)
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -234,11 +291,48 @@ def spawn(agent: str,
 def resume(kiro_session_id: str,
            tmux_session: Optional[str] = None,
            cwd: Optional[str] = None,
-           ready_timeout: int = _SPAWN_READY_TIMEOUT) -> dict[str, object]:
-    """Create a tmux session running ``kiro-cli --v3 chat --resume-id X``."""
+           ready_timeout: int = _SPAWN_READY_TIMEOUT,
+           parent: Optional[str] = None,
+           journey: Optional[str] = None,
+           role: Optional[str] = None,
+           agent: Optional[str] = None) -> dict[str, object]:
+    """Create a tmux session running ``kiro-cli --v3 chat --resume-id X``.
+
+    Lineage (optional, backward-compatible): mirrors :func:`spawn`. When BOTH
+    ``parent`` and ``journey`` are given the resumed knight (its session id IS
+    ``kiro_session_id``) is appended/updated in that journey's ``meta.json``.
+    FAIL-SOFT; result carries ``lineage_recorded`` (+ ``lineage_warning`` when
+    False). ``agent`` is optional metadata for the recorded entry (defaults to
+    an empty string; ``role`` then falls back to it). Absent lineage args ->
+    behaves EXACTLY as before.
+
+    Returns {tmux_session, session_id, resolved, lineage_recorded[,
+    lineage_warning]}.
+    """
     if not kiro_session_id or not kiro_session_id.strip():
         raise ValueError("kiro_session_id must be a non-empty string")
 
+    return _resume_core(kiro_session_id, tmux_session=tmux_session, cwd=cwd,
+                        ready_timeout=ready_timeout, parent=parent,
+                        journey=journey, role=role, agent=agent)
+
+
+def _resume_core(kiro_session_id: str,
+                 tmux_session: Optional[str] = None,
+                 cwd: Optional[str] = None,
+                 ready_timeout: int = _SPAWN_READY_TIMEOUT,
+                 parent: Optional[str] = None,
+                 journey: Optional[str] = None,
+                 role: Optional[str] = None,
+                 agent: Optional[str] = None,
+                 extra: Optional[dict[str, object]] = None) -> dict[str, object]:
+    """Shared resume mechanic: launch tmux + ``--resume-id`` + wait-ready +
+    optional lineage. Both :func:`resume` and :func:`resume_clean` call this so
+    the tmux-launch+wait-ready+lineage logic is written ONCE (no duplication).
+
+    ``extra`` merges caller-specific keys (e.g. ``removed_stale_lock``) into the
+    returned dict without the core needing to know about them.
+    """
     session_name = tmux_session or f"knight-resume-{uuid.uuid4().hex[:6]}"
     if _session_exists(session_name):
         raise TmuxError(f"tmux session '{session_name}' already exists")
@@ -246,10 +340,165 @@ def resume(kiro_session_id: str,
     work_dir = cwd or str(Path.cwd())
     launch = f"kiro-cli --v3 chat --resume-id {kiro_session_id}"
     _tmux("new-session", "-d", "-s", session_name, "-x", "220", "-y", "50", "-c",
-          work_dir, launch)
+          work_dir, *_secret_env_flags(), launch)
     _wait_until_ready(session_name, ready_timeout)
-    return {"tmux_session": session_name, "session_id": kiro_session_id,
-            "resolved": True}
+    result: dict[str, object] = {
+        "tmux_session": session_name,
+        "session_id": kiro_session_id,
+        "resolved": True,
+    }
+    if extra:
+        result.update(extra)
+    _apply_lineage(result, kiro_session_id, session_name, agent or "",
+                   parent, journey, role)
+    return result
+
+
+def _apply_lineage(result: dict[str, object],
+                   session_id: Optional[str],
+                   tmux_session: str,
+                   agent: str,
+                   parent: Optional[str],
+                   journey: Optional[str],
+                   role: Optional[str]) -> None:
+    """Fold optional parent-lineage recording into a spawn/resume result dict.
+
+    Backward-compatible contract:
+      * lineage args absent (no ``parent`` AND no ``journey``) -> record nothing;
+        set ``lineage_recorded=False`` with NO ``lineage_warning`` (unchanged
+        shape apart from the always-present boolean flag).
+      * only one of the pair given, or the session id did not resolve -> a
+        ``lineage_warning`` explains why nothing was recorded.
+      * both given AND a session id -> delegate to the FAIL-SOFT
+        :func:`motor.lineage.record_lineage`; never raises, never hangs.
+    """
+    if not parent and not journey:
+        result["lineage_recorded"] = False
+        return
+
+    if not (parent and journey):
+        missing = "journey" if parent else "parent"
+        result["lineage_recorded"] = False
+        result["lineage_warning"] = (
+            f"lineage needs BOTH --parent and --journey; missing --{missing}"
+        )
+        return
+
+    if not session_id:
+        result["lineage_recorded"] = False
+        result["lineage_warning"] = (
+            "session id unresolved; lineage not recorded (resolve via "
+            "scan_knights, then re-record)"
+        )
+        return
+
+    recorded, warning = record_lineage(
+        journey_id=journey,
+        session_id=session_id,
+        tmux_session=tmux_session,
+        agent=agent,
+        parent_session_id=parent,
+        role=role,
+    )
+    result["lineage_recorded"] = recorded
+    if warning:
+        result["lineage_warning"] = warning
+
+
+# --------------------------------------------------------------------------- #
+# resume_clean: stale-lock-aware resume (kiro has no native lock/force flag)
+# --------------------------------------------------------------------------- #
+def resume_clean(kiro_session_id: str,
+                 tmux_session: Optional[str] = None,
+                 cwd: Optional[str] = None,
+                 ready_timeout: int = _SPAWN_READY_TIMEOUT,
+                 parent: Optional[str] = None,
+                 journey: Optional[str] = None,
+                 role: Optional[str] = None,
+                 agent: Optional[str] = None,
+                 root: Optional[Path] = None,
+                 pid_alive_fn: Optional[lockcheck.PidAliveFn] = None
+                 ) -> dict[str, object]:
+    """Resume a session, first clearing a STALE (dead-owner) ``.lock`` if any.
+
+    kiro-cli has no lock/force flag, so a ``.lock`` left by a DEAD process makes
+    a plain :func:`resume` hang on "Initializing". This verb inspects the lock
+    (via :mod:`motor.lockcheck`, which resolves the lock path from the session's
+    ``source_path`` — nothing hardcoded) and applies the safe decision table:
+
+      * NO lock            -> resume straight away (``removed_stale_lock=False``).
+      * lock, DEAD pid     -> remove the stale ``.lock``, then resume
+                              (``removed_stale_lock=True``).
+      * lock, ALIVE pid    -> ⚠ REFUSE: do NOT delete, do NOT kill, do NOT
+                              resume. ``{resumed: False, reason: 'held_by_live',
+                              pid, tmux_session: None}``. NON-NEGOTIABLE — never
+                              clear a lock whose owner is provably alive.
+      * pid unparseable /  -> REFUSE (safer than guessing): ``{resumed: False,
+        lock unreadable        reason: 'unknown_lock', tmux_session: None}``.
+
+    On the resume path the SAME mechanic as :func:`resume` runs (shared
+    ``_resume_core``: tmux launch + ``--resume-id`` + wait-ready + optional
+    lineage), so nothing is duplicated. Lineage is FAIL-SOFT.
+
+    The pid-liveness probe is injectable (``pid_alive_fn``, default the real
+    ``/proc`` check) so tests are deterministic without a real process.
+
+    Returns:
+        success -> {resumed: True, tmux_session, session_id, removed_stale_lock,
+                    [pid], resolved, lineage_recorded[, lineage_warning]}
+        refuse  -> {resumed: False, reason, tmux_session: None,
+                    removed_stale_lock: False[, pid]}
+    """
+    if not kiro_session_id or not kiro_session_id.strip():
+        raise ValueError("kiro_session_id must be a non-empty string")
+
+    # 1) Inspect the lock. A missing session dir/file fails SOFT (clear reason).
+    try:
+        decision = lockcheck.inspect_lock(kiro_session_id, root=root,
+                                          pid_alive_fn=pid_alive_fn)
+    except SessionNotFoundError as exc:
+        return {"resumed": False, "reason": "session_not_found",
+                "tmux_session": None, "removed_stale_lock": False,
+                "detail": str(exc)}
+
+    state = decision["state"]
+
+    # 2) Apply the safety decision table.
+    if state == lockcheck.LOCK_LIVE:
+        # NON-NEGOTIABLE: owner provably alive -> refuse, touch nothing.
+        return {"resumed": False, "reason": lockcheck.LOCK_LIVE,
+                "pid": decision.get("pid"), "tmux_session": None,
+                "removed_stale_lock": False}
+
+    if state == lockcheck.LOCK_UNKNOWN:
+        # Unparseable pid / unreadable lock -> refuse rather than guess.
+        return {"resumed": False, "reason": lockcheck.LOCK_UNKNOWN,
+                "tmux_session": None, "removed_stale_lock": False}
+
+    removed_stale_lock = False
+    if state == lockcheck.LOCK_STALE:
+        # Dead owner: the lock is stale -> remove it, then resume.
+        try:
+            Path(decision["lock_path"]).unlink()
+            removed_stale_lock = True
+        except FileNotFoundError:
+            removed_stale_lock = True  # already gone; equivalent to cleared
+        except OSError as exc:
+            # Could not clear the stale lock -> refuse (resume would hang).
+            return {"resumed": False, "reason": "stale_lock_unremovable",
+                    "pid": decision.get("pid"), "tmux_session": None,
+                    "removed_stale_lock": False, "detail": str(exc)}
+
+    # 3) Clean lock state (absent or just-cleared): perform the shared resume.
+    result = _resume_core(
+        kiro_session_id, tmux_session=tmux_session, cwd=cwd,
+        ready_timeout=ready_timeout, parent=parent, journey=journey,
+        role=role, agent=agent,
+        extra={"resumed": True, "removed_stale_lock": removed_stale_lock},
+    )
+    if state == lockcheck.LOCK_STALE:
+        result["pid"] = decision.get("pid")
+    return result
 
 
 # --------------------------------------------------------------------------- #
