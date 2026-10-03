@@ -1,0 +1,7 @@
+# journey-tui-web v1 — pinned. Python 3.11+ required (pydantic X | None syntax,
+# FastAPI lifespan). System binaries required at runtime: ttyd + tmux on PATH.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+# test-only (not needed to run the server):
+httpx==0.28.1
+pytest==8.3.4

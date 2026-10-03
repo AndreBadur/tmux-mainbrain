@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Per-machine deployment secrets — never commit (templates .example are OK).
+deploy/deploy.env
