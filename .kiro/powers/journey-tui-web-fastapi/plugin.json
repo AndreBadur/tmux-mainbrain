@@ -1,0 +1,26 @@
+{
+  "$schema": "https://kiro.dev/schemas/plugin.json",
+  "name": "journey-tui-web-fastapi",
+  "version": "1.0.0",
+  "description": "Build the journey-tui-web backend: a tiny Python FastAPI app that serves a static sidebar+iframe page, binds the motor in-process, and manages ONE ttyd child (tmux attach) switched via tmux switch-client. Distilled from the FastAPI official lifespan docs + the zhanymkanov/fastapi-best-practices conventions, grounded in the locked v1 sketch.",
+  "author": {
+    "name": "journey-tui-web (web-sourced best practices, Steward forged)"
+  },
+  "keywords": [
+    "journey-tui-web",
+    "fastapi",
+    "uvicorn",
+    "ttyd",
+    "tmux switch-client",
+    "staticfiles",
+    "lifespan",
+    "subprocess",
+    "pydantic",
+    "cascade",
+    "motor",
+    "python web"
+  ],
+  "skills": [
+    "skills/journey-tui-web-fastapi/SKILL.md"
+  ]
+}
