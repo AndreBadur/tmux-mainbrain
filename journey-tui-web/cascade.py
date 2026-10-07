@@ -124,11 +124,14 @@ def parse_journey(meta: Mapping[str, Any]) -> Optional[JourneyTree]:
 
     tree_root = meta.get("tree_root")
     root_role = None
+    root_tmux = None
     if isinstance(tree_root, Mapping):
         root_role = tree_root.get("role")
+        root_tmux = tree_root.get("tmux_session")  # explicit king session name
     root = CascadeNode(
         session_id=root_sid,
         role=root_role or "king",
+        tmux_session=root_tmux,
         level=1,
     )
 
@@ -239,7 +242,17 @@ def build_cascade(
         tree = parse_journey(meta)
         if tree is None:
             continue
-        _enrich(tree.root, live, sessions)
+        # King convention: if the root has no explicit tmux_session, prefer the
+        # live `king-<journey_id>` session (set by New Journey creation). Only
+        # applied when that session is actually live, so a king without it still
+        # falls through to the id-suffix resolver in _enrich (e.g. journey-tui's
+        # king-354dd79f). Additive — never overwrites an explicit name.
+        root = tree.root
+        if not root.tmux_session:
+            convention = f"king-{tree.journey_id}"
+            if convention in sessions:
+                root.tmux_session = convention
+        _enrich(root, live, sessions)
         trees.append(tree)
     trees.sort(key=lambda t: t.journey_id)
     return trees

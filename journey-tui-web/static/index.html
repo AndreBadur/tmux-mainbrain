@@ -15,13 +15,64 @@
       --sel: #1f6feb;
     }
     * { box-sizing: border-box; }
-    html, body { height: 100%; margin: 0; }
+    html, body {
+      height: 100%;
+      margin: 0;
+      /* Stop mobile pull-to-refresh / rubber-band: swipes shouldn't reload or
+         bounce the page. This alone is enough on modern browsers and does NOT
+         block taps or inner scrolling. */
+      overscroll-behavior: none;
+    }
     body {
       display: flex;
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       background: var(--bg);
       color: var(--fg);
     }
+    /* Hamburger toggle — hidden on desktop, shown on mobile via the media query. */
+    #menu-toggle {
+      display: none;
+      position: fixed;
+      top: 10px;
+      left: 10px;
+      z-index: 30;
+      width: 42px;
+      height: 42px;
+      font-size: 20px;
+      line-height: 1;
+      color: var(--fg);
+      background: var(--panel);
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    /* Backdrop behind the drawer on mobile (tap to close). */
+    #backdrop {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.5);
+      z-index: 10;
+    }
+    /* Scroll-up / scroll-down buttons for the cascade list (mobile only).
+       Stacked under the hamburger; above the drawer so they stay tappable. */
+    .scrollbtn {
+      display: none;
+      position: fixed;
+      left: 10px;
+      z-index: 30;
+      width: 42px;
+      height: 42px;
+      font-size: 16px;
+      line-height: 1;
+      color: var(--fg);
+      background: var(--panel);
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    #scroll-up { top: 60px; }
+    #scroll-down { top: 108px; }
     #sidebar {
       width: 340px;
       min-width: 240px;
@@ -57,6 +108,48 @@
     }
     #console-btn:hover { background: #2d333b; border-color: var(--accent); }
     #console-btn.active { background: var(--sel); border-color: var(--sel); color: #fff; }
+    #newjourney-btn {
+      display: block;
+      width: calc(100% - 12px);
+      margin: 0 6px 8px;
+      padding: 6px 8px;
+      font-family: inherit;
+      font-size: 12px;
+      color: var(--fg);
+      background: #21262d;
+      border: 1px solid #30363d;
+      border-radius: 5px;
+      cursor: pointer;
+      text-align: left;
+    }
+    #newjourney-btn:hover { background: #2d333b; border-color: var(--alive); }
+    #newjourney-form { margin: 0 6px 8px; }
+    #newjourney-name {
+      width: 100%;
+      padding: 6px 8px;
+      font-family: inherit;
+      font-size: 12px;
+      color: var(--fg);
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 5px;
+      margin-bottom: 6px;
+    }
+    .nj-actions { display: flex; gap: 6px; }
+    .nj-actions button {
+      flex: 1 1 auto;
+      padding: 5px 6px;
+      font-family: inherit;
+      font-size: 11.5px;
+      color: var(--fg);
+      background: #21262d;
+      border: 1px solid #30363d;
+      border-radius: 5px;
+      cursor: pointer;
+    }
+    #newjourney-create:hover { background: var(--sel); border-color: var(--sel); color: #fff; }
+    #newjourney-cancel:hover { background: #2d333b; }
+    .nj-err { color: #f85149; font-size: 11px; margin-top: 6px; min-height: 0; }
     ul.tree { list-style: none; margin: 0; padding: 0; }
     ul.tree ul { list-style: none; margin: 0; padding-left: 14px; border-left: 1px solid #21262d; }
     li.node { margin: 1px 0; }
@@ -93,14 +186,66 @@
     .ctx { margin-left: auto; font-size: 10.5px; color: var(--muted); flex: 0 0 auto; }
     .row.selected .ctx { color: #cfe3ff; }
     .journey { font-size: 11px; color: var(--muted); margin: 10px 6px 2px; text-transform: uppercase; }
-    #main { flex: 1 1 auto; display: flex; }
+    #main { flex: 1 1 auto; display: flex; min-width: 0; }
     iframe { flex: 1 1 auto; width: 100%; height: 100%; border: 0; background: #000; }
+
+    /* ---- Mobile / small or landscape-phone: sidebar becomes a slide-in drawer;
+       terminal is full-screen. Triggers on narrow width OR short height, so a
+       phone in LANDSCAPE (wide but short) also gets the drawer, not the cramped
+       desktop split. ---- */
+    @media (max-width: 768px), (max-height: 500px) {
+      #menu-toggle { display: block; }
+      .scrollbtn { display: block; }
+      #sidebar {
+        position: fixed;
+        top: 0;
+        left: 0;
+        bottom: 0;
+        width: 84vw;
+        max-width: 320px;
+        min-width: 0;
+        z-index: 20;
+        padding-top: 60px;            /* clear the fixed hamburger */
+        border-right: 1px solid #30363d;
+        box-shadow: 2px 0 16px rgba(0, 0, 0, 0.5);
+        transform: translateX(-100%); /* off-screen by default */
+        transition: transform 0.22s ease;
+        resize: none;                 /* no horizontal-resize handle on touch */
+        -webkit-overflow-scrolling: touch;
+      }
+      #sidebar.open { transform: translateX(0); }
+      body.drawer-open #backdrop { display: block; }
+      #main { width: 100%; }
+      /* Bigger tap targets for fingers. */
+      .row { padding: 9px 8px; font-size: 14px; }
+      #console-btn { padding: 11px 10px; font-size: 14px; }
+      ul.tree ul { padding-left: 12px; }
+      #sidebar h1 { font-size: 14px; }
+    }
+    /* Respect users who prefer no motion. */
+    @media (prefers-reduced-motion: reduce) {
+      #sidebar { transition: none; }
+      .dot.working { animation: none; }
+    }
   </style>
 </head>
 <body>
+  <button id="menu-toggle" type="button" aria-label="toggle menu" aria-expanded="false">☰</button>
+  <button id="scroll-up" type="button" aria-label="scroll list up" class="scrollbtn">▲</button>
+  <button id="scroll-down" type="button" aria-label="scroll list down" class="scrollbtn">▼</button>
+  <div id="backdrop"></div>
   <nav id="sidebar">
     <h1>Subagent Cascade</h1>
     <button id="console-btn" type="button" title="open your own shell terminal in the view">⌁ Console</button>
+    <button id="newjourney-btn" type="button" title="bootstrap a fresh wise-king journey">➕ New Journey</button>
+    <form id="newjourney-form" hidden>
+      <input id="newjourney-name" type="text" placeholder="journey name…" autocomplete="off" />
+      <div class="nj-actions">
+        <button type="submit" id="newjourney-create">Create</button>
+        <button type="button" id="newjourney-cancel">Cancel</button>
+      </div>
+      <div id="newjourney-err" class="nj-err"></div>
+    </form>
     <div id="status">loading…</div>
     <div id="trees"></div>
   </nav>
@@ -115,6 +260,6 @@
     <iframe id="term" title="terminal"
             allow="clipboard-read; clipboard-write"></iframe>
   </main>
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=5"></script>
 </body>
 </html>

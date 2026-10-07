@@ -42,6 +42,9 @@ fi
 TUNNEL_NAME="${JTW_TUNNEL_NAME:-}"
 PUBLIC_HOST_APP="${JTW_PUBLIC_HOST_APP:-}"
 PUBLIC_HOST_TERM="${JTW_PUBLIC_HOST:-}"       # the term hostname (iframe origin)
+# OPTIONAL operator override. Leave EMPTY (the default): the app auto-creates +
+# boots the console shell (jtw-console), independent of any knight. Only set
+# this to pin ttyd to a specific LIVE session on boot.
 BOOT_SESSION="${JTW_BOOT_SESSION:-}"
 TTYD_SCHEME="${JTW_TTYD_SCHEME:-https}"
 PUBLIC_PORT="${JTW_PUBLIC_PORT-}"             # may be intentionally empty (443)
@@ -49,7 +52,7 @@ PUBLIC_PORT="${JTW_PUBLIC_PORT-}"             # may be intentionally empty (443)
 [ -n "$TUNNEL_NAME" ]      || die "JTW_TUNNEL_NAME is required (set it in deploy.env)"
 [ -n "$PUBLIC_HOST_APP" ]  || die "JTW_PUBLIC_HOST_APP is required (the app hostname)"
 [ -n "$PUBLIC_HOST_TERM" ] || die "JTW_PUBLIC_HOST is required (the terminal hostname)"
-[ -n "$BOOT_SESSION" ]     || die "JTW_BOOT_SESSION is required (a live tmux session)"
+# BOOT_SESSION is intentionally OPTIONAL — no die here.
 
 APP_UNIT="journey-tui-web.service"
 TUN_UNIT="journey-tui-web-tunnel.service"
@@ -94,6 +97,17 @@ cloudflared tunnel route dns "$TUNNEL_NAME" "$PUBLIC_HOST_TERM" 2>&1 || true
 say "Writing unit files to ${UNIT_DIR}"
 mkdir -p "$UNIT_DIR"
 
+# Only pin JTW_BOOT_SESSION in the unit when the operator explicitly set one.
+# Empty (the default) => the app auto-boots the console shell, knight-independent.
+if [ -n "$BOOT_SESSION" ]; then
+  BOOT_ENV_LINE="Environment=JTW_BOOT_SESSION=${BOOT_SESSION}
+"
+  warn "pinning JTW_BOOT_SESSION=${BOOT_SESSION} (override). Leave it empty to auto-boot jtw-console."
+else
+  BOOT_ENV_LINE=""
+  echo "no JTW_BOOT_SESSION override -> app will auto-boot the console shell"
+fi
+
 cat > "${UNIT_DIR}/${APP_UNIT}" <<UNIT_APP
 [Unit]
 Description=journey-tui-web — FastAPI subagent-cascade observatory (app + ttyd)
@@ -106,8 +120,7 @@ WorkingDirectory=%h/tmux-mainbrain/journey-tui-web
 Environment=PYTHONPATH=%h/tmux-mainbrain
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=TMUX_TMPDIR=/tmp
-Environment=JTW_BOOT_SESSION=${BOOT_SESSION}
-Environment=JTW_PUBLIC_HOST=${PUBLIC_HOST_TERM}
+${BOOT_ENV_LINE}Environment=JTW_PUBLIC_HOST=${PUBLIC_HOST_TERM}
 Environment=JTW_TTYD_SCHEME=${TTYD_SCHEME}
 Environment=JTW_PUBLIC_PORT=${PUBLIC_PORT}
 ExecStart=%h/tmux-mainbrain/journey-tui-web/.venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8080

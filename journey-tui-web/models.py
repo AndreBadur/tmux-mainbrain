@@ -74,5 +74,21 @@ class ClientConfig(BaseModel):
     auth_required: bool
 
 
+class NewJourney(BaseModel):
+    """Request body for ``POST /api/journey``."""
+
+    name: str
+
+
+class JourneyResult(BaseModel):
+    """Result of ``POST /api/journey``."""
+
+    ok: bool
+    journey_id: str | None = None
+    tmux_session: str | None = None
+    king_session: str | None = None
+    error: str | None = None
+
+
 # Resolve the forward reference for the self-referential ``children`` field.
 CascadeNode.model_rebuild()

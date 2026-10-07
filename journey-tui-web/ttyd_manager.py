@@ -205,6 +205,58 @@ class TtydManager:
         self._client = resolved_client
         return SwitchResult(ok=True, target=target)
 
+    # --- scrollback (kiro-cli terminal) ------------------------------------
+
+    def current_session(self) -> Optional[str]:
+        """The tmux session ttyd's client is currently showing, or None."""
+        client = self._client or self.resolve_ttyd_client()
+        if not client:
+            return None
+        res = self._run_tmux(
+            ["display-message", "-c", client, "-p", "#{client_session}"]
+        )
+        if res.returncode != 0:
+            return None
+        name = res.stdout.strip()
+        return name or None
+
+    def scroll(self, lines: int) -> SwitchResult:
+        """Scroll the terminal's tmux scrollback by ``lines`` (negative = down).
+
+        This sends the SAME commands a mouse-wheel/copy-mode scroll does, server
+        side, so it works even though the terminal is a cross-origin iframe the
+        page cannot touch. We enter copy-mode (idempotent) then send N scroll-up
+        or scroll-down steps. Scrolling to the live bottom auto-exits copy-mode,
+        which is the desired behavior.
+        """
+        session = self.current_session()
+        if not session:
+            return SwitchResult(
+                ok=False,
+                error="no active terminal session to scroll "
+                      "(has a browser connected yet?)",
+            )
+        n = abs(lines)
+        action = "scroll-up" if lines > 0 else "scroll-down"
+        try:
+            # Enter copy-mode if not already in it (harmless if already there).
+            in_mode = self._run_tmux(
+                ["display-message", "-t", session, "-p", "#{pane_in_mode}"]
+            )
+            if in_mode.returncode == 0 and in_mode.stdout.strip() != "1":
+                self._run_tmux(["copy-mode", "-t", session])
+            res = self._run_tmux(
+                ["send-keys", "-t", session, "-X", "-N", str(n), action]
+            )
+        except subprocess.TimeoutExpired:
+            return SwitchResult(ok=False, target=session, error="tmux scroll timed out")
+        if res.returncode != 0:
+            return SwitchResult(
+                ok=False, target=session,
+                error=res.stderr.strip() or "scroll failed",
+            )
+        return SwitchResult(ok=True, target=session)
+
     # --- console session ---------------------------------------------------
 
     def session_exists(self, name: str) -> bool:

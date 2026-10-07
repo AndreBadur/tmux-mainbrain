@@ -38,12 +38,18 @@ embeds ONE `ttyd` terminal (main `<iframe>`), switching which knight it shows vi
 Requires **Python 3.11+** and `ttyd` + `tmux` on `PATH`.
 
 ```bash
+# Use the project venv's python (the system python3 lacks fastapi).
 # PYTHONPATH must include ~/tmux-mainbrain so `import motor` resolves.
+# No JTW_BOOT_SESSION needed — ttyd boots an auto-created `jtw-console` shell.
 cd ~/tmux-mainbrain/journey-tui-web
-PYTHONPATH=~/tmux-mainbrain python3 -m uvicorn app:app --host 127.0.0.1 --port 8080
+PYTHONPATH=~/tmux-mainbrain TMUX_TMPDIR=/tmp PATH="$HOME/.local/bin:$PATH" \
+  .venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8080
 ```
 
 Then open <http://127.0.0.1:8080/>.
+
+> Running as a systemd user service instead? `systemctl --user restart journey-tui-web.service`
+> (the unit no longer pins a knight at boot).
 
 ### Configuration (env vars)
 
@@ -56,10 +62,12 @@ Then open <http://127.0.0.1:8080/>.
 | `JTW_TTYD_CRED` | _(none)_ | ttyd HTTP basic-auth as `user:pass` (set this whenever the bind isn't localhost) |
 | `JTW_PUBLIC_HOST` | `127.0.0.1` | host a BROWSER uses to reach ttyd — drives the iframe src (LAN IP or DNS name) |
 | `JTW_TTYD_SCHEME` | `http` | scheme the browser uses for ttyd (`https` if fronted by TLS) |
-| `JTW_BOOT_SESSION` | first live knight | the tmux session ttyd attaches to at boot |
+| `JTW_BOOT_SESSION` | _(empty → auto console)_ | OPTIONAL override to pin ttyd to a specific live session at boot |
 
-> If no `JTW_BOOT_SESSION` is set and no live governed knight is found, ttyd will
-> not start — set `JTW_BOOT_SESSION` to a live tmux session name.
+> By default (no `JTW_BOOT_SESSION`) the app **auto-creates and boots a console
+> shell** (`jtw-console`), so startup never depends on any knight being alive.
+> Set `JTW_BOOT_SESSION` only to pin ttyd to a specific live session; if that
+> session isn't live, startup fails loud rather than silently falling back.
 
 > The terminal iframe src is **computed at runtime** from `GET /api/config`
 > (`JTW_PUBLIC_HOST` + `JTW_TTYD_PORT` + `JTW_TTYD_SCHEME`), so it is correct for
@@ -92,7 +100,9 @@ Two options:
    export JTW_BIND=0.0.0.0 JTW_TTYD_BIND=0.0.0.0
    export JTW_PUBLIC_HOST=<lan-ip-or-dns>      # e.g. 192.168.15.145
    export JTW_TTYD_CRED=<user>:<pass>
-   # run uvicorn with --host 0.0.0.0
+   # then launch with --host 0.0.0.0:
+   PYTHONPATH=~/tmux-mainbrain TMUX_TMPDIR=/tmp PATH="$HOME/.local/bin:$PATH" \
+     .venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8080
    ```
    Open the firewall for ports 8080 and 7681. The terminal will prompt for the
    basic-auth credentials in the browser.

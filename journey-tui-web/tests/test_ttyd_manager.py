@@ -52,3 +52,62 @@ def test_empty_credential_is_treated_as_none():
     m = TtydManager(boot_session="s", credential="")
     assert m.credential is None
     assert "-c" not in m._build_cmd()
+
+
+# --- ensure_console_session: idempotent create ------------------------------
+
+class _FakeProc:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def test_ensure_console_session_creates_when_missing(monkeypatch):
+    m = TtydManager(boot_session="jtw-console")
+    calls = []
+
+    def fake_run(args):
+        calls.append(args)
+        if args[0] == "has-session":
+            # first probe: not present (rc=1); after new-session: present (rc=0)
+            created = any(a[0] == "new-session" for a in calls[:-1])
+            return _FakeProc(returncode=0 if created else 1)
+        if args[0] == "new-session":
+            return _FakeProc(returncode=0)
+        return _FakeProc(returncode=0)
+
+    monkeypatch.setattr(m, "_run_tmux", fake_run)
+    assert m.ensure_console_session("jtw-console", cwd="/tmp") is True
+    assert any(a[0] == "new-session" for a in calls), "should create when missing"
+
+
+def test_ensure_console_session_idempotent_when_exists(monkeypatch):
+    m = TtydManager(boot_session="jtw-console")
+    calls = []
+
+    def fake_run(args):
+        calls.append(args)
+        if args[0] == "has-session":
+            return _FakeProc(returncode=0)  # already exists
+        return _FakeProc(returncode=0)
+
+    monkeypatch.setattr(m, "_run_tmux", fake_run)
+    assert m.ensure_console_session("jtw-console", cwd="/tmp") is True
+    # idempotent: existing session -> NO new-session call, no error
+    assert all(a[0] != "new-session" for a in calls)
+
+
+def test_ensure_console_session_reports_failure(monkeypatch):
+    m = TtydManager(boot_session="jtw-console")
+
+    def fake_run(args):
+        if args[0] == "has-session":
+            return _FakeProc(returncode=1)       # not present
+        if args[0] == "new-session":
+            return _FakeProc(returncode=1, stderr="boom")  # create failed
+        return _FakeProc(returncode=1)
+
+    monkeypatch.setattr(m, "_run_tmux", fake_run)
+    # fail loud: creation failure returns False, never raises/hangs
+    assert m.ensure_console_session("jtw-console", cwd="/tmp") is False

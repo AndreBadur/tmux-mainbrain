@@ -15,6 +15,8 @@ Requirements at runtime:
 from __future__ import annotations
 
 import os
+import subprocess
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -22,10 +24,18 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from starlette.concurrency import run_in_threadpool
 
 import cascade as cascade_mod
-from models import CascadeNode, ClientConfig, Health, JourneyTree, SwitchResult
+import journey as journey_mod
+from models import (
+    CascadeNode,
+    ClientConfig,
+    Health,
+    JourneyResult,
+    JourneyTree,
+    NewJourney,
+    SwitchResult,
+)
 from ttyd_manager import DEFAULT_BIND, TtydManager
 
 # --- configuration (env-overridable) -----------------------------------------
@@ -58,9 +68,9 @@ TTYD_SCHEME = os.environ.get("JTW_TTYD_SCHEME", "http").strip()
 # public port is the standard 443/80, so set JTW_PUBLIC_PORT="" (empty) to omit
 # the port from the iframe URL entirely (e.g. https://console-term.domain/).
 PUBLIC_PORT = os.environ.get("JTW_PUBLIC_PORT", os.environ.get("JTW_TTYD_PORT", "7681")).strip()
-# The tmux session ttyd attaches to at boot. Must be a LIVE session; the UI then
-# switches away from it on click. Overridable; defaults to an env or the first
-# alive governed knight discovered at startup.
+# OPTIONAL operator override for the boot session. When set AND live, ttyd
+# attaches to it; otherwise (the default) the app auto-creates and boots the
+# console shell (CONSOLE_SESSION) — boot is knight-independent and deterministic.
 BOOT_SESSION_ENV = os.environ.get("JTW_BOOT_SESSION")
 
 # A dedicated plain-shell tmux session for the operator's own direct terminal
@@ -94,23 +104,38 @@ def _import_motor_resume_clean():
     return resume_clean
 
 
-def _first_alive_target(trees: list[JourneyTree]) -> Optional[str]:
-    """First clickable (alive + has tmux) node's tmux session, DFS order."""
+def _import_motor_spawn():
+    from motor import spawn  # noqa: PLC0415 - lazy, in-process binding
+    return spawn
 
-    def walk(node: CascadeNode) -> Optional[str]:
-        if node.clickable and node.tmux_session:
-            return node.tmux_session
-        for child in node.children:
-            found = walk(child)
-            if found is not None:
-                return found
-        return None
 
-    for tree in trees:
-        found = walk(tree.root)
-        if found is not None:
-            return found
-    return None
+# --- thin tmux helpers for journey bootstrap (fixed argv, bounded timeout) ---
+
+def _tmux_session_exists(name: str) -> bool:
+    try:
+        r = subprocess.run(["tmux", "has-session", "-t", name],  # noqa: S603/S607
+                           capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
+def _tmux_capture_pane(name: str) -> str:
+    try:
+        r = subprocess.run(["tmux", "capture-pane", "-t", name, "-p", "-S", "-80"],
+                           capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    return r.stdout if r.returncode == 0 else ""
+
+
+def _tmux_kill_session(name: str) -> None:
+    # Best-effort cleanup of a half-spawned king. Bounded; never raises up.
+    try:
+        subprocess.run(["tmux", "kill-session", "-t", name],  # noqa: S603/S607
+                       capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
 
 
 def _load_trees() -> tuple[list[JourneyTree], list[str]]:
@@ -120,31 +145,47 @@ def _load_trees() -> tuple[list[JourneyTree], list[str]]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Own the ONE ttyd child here (never at import time)."""
-    boot_session = BOOT_SESSION_ENV
-    if not boot_session:
-        try:
-            trees, _errors = await run_in_threadpool(_load_trees)
-            boot_session = _first_alive_target(trees)
-        except Exception as exc:  # noqa: BLE001 - startup must surface, not crash import
-            app.state.startup_error = f"cascade load at startup failed: {exc}"
-            boot_session = None
-    if not boot_session:
-        # No live knight to attach to. Fall back to a self-session so ttyd can
-        # still start; the operator can set JTW_BOOT_SESSION explicitly.
-        app.state.startup_error = (
-            "no live governed knight with a tmux session found; "
-            "set JTW_BOOT_SESSION to a live tmux session"
-        )
-        ttyd = None
+    """Own the ONE ttyd child here (never at import time).
+
+    Boot order (deterministic, knight-independent):
+      a. JTW_BOOT_SESSION set AND live  -> use it (explicit operator override).
+      b. otherwise                      -> the dedicated console shell session
+         (CONSOLE_SESSION), auto-created if missing. ttyd ALWAYS has a session
+         to attach to, so startup never fails because a knight is dead.
+    Knights are reached only by clicking (switch-client), never at boot.
+    """
+    ttyd = TtydManager(
+        boot_session=CONSOLE_SESSION,  # provisional; finalized below
+        port=TTYD_PORT,
+        bind=TTYD_BIND,
+        credential=TTYD_CRED,
+    )
+
+    boot_session = CONSOLE_SESSION
+    override = (BOOT_SESSION_ENV or "").strip()
+    if override:
+        # Explicit override: honor it ONLY if it is actually live, else fail
+        # loud (the operator asked for a specific session that isn't there).
+        if ttyd.session_exists(override):
+            boot_session = override
+        else:
+            app.state.startup_error = (
+                f"JTW_BOOT_SESSION='{override}' is not a live tmux session"
+            )
+            raise RuntimeError(app.state.startup_error)
     else:
-        ttyd = TtydManager(
-            boot_session=boot_session,
-            port=TTYD_PORT,
-            bind=TTYD_BIND,
-            credential=TTYD_CRED,
-        )
-        ttyd.start()
+        # Default: always boot to the auto-created console shell. Create it
+        # BEFORE start() so `tmux attach -t <console>` never races a missing
+        # session.
+        if not ttyd.ensure_console_session(CONSOLE_SESSION, cwd=str(ROOT_DIR)):
+            app.state.startup_error = (
+                f"could not create console session '{CONSOLE_SESSION}'"
+            )
+            raise RuntimeError(app.state.startup_error)
+        boot_session = CONSOLE_SESSION
+
+    ttyd.boot_session = boot_session
+    ttyd.start()
     app.state.ttyd = ttyd
     try:
         yield
@@ -156,6 +197,22 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="journey-tui-web", lifespan=lifespan)
 app.state.ttyd = None
 app.state.startup_error = None
+
+
+@app.middleware("http")
+async def _no_cache_static(request, call_next):
+    """Tell browsers/CDN to always revalidate the page + static assets.
+
+    The ETag still allows a cheap 304, but ``no-cache`` forbids serving a stale
+    copy WITHOUT revalidating — so a UI update is never masked by a cached
+    index.html / app.js on a phone or behind Cloudflare.
+    """
+    response = await call_next(request)
+    path = request.url.path
+    if path == "/" or path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
 
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -266,3 +323,64 @@ def console() -> SwitchResult:
             error=f"could not create console session '{CONSOLE_SESSION}'",
         )
     return ttyd.switch_client(CONSOLE_SESSION)
+
+
+@app.post("/api/scroll/{direction}", response_model=SwitchResult)
+def scroll(direction: str) -> SwitchResult:
+    """Scroll the embedded kiro-cli terminal's tmux scrollback.
+
+    ``direction`` is ``up`` or ``down``. This drives tmux copy-mode server-side
+    (the terminal is a cross-origin iframe the page cannot scroll directly), so
+    the arrow buttons move the ACTUAL terminal history.
+    """
+    ttyd = app.state.ttyd
+    if ttyd is None:
+        raise HTTPException(status_code=503, detail="ttyd is not running")
+    step = 10  # lines per tap
+    if direction == "up":
+        return ttyd.scroll(step)
+    if direction == "down":
+        return ttyd.scroll(-step)
+    raise HTTPException(status_code=400, detail="direction must be 'up' or 'down'")
+
+
+@app.post("/api/journey", response_model=JourneyResult)
+def new_journey(body: NewJourney) -> JourneyResult:
+    """Bootstrap a fresh wise-king journey: create dirs, spawn the king (named
+    after the journey, at ROOT_DIR), capture its session id, write meta.json.
+
+    The new journey appears in the cascade on the next 3s poll (no extra wiring)
+    because cascade.py globs ``journeys/*/meta.json``.
+    """
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="journey name must not be empty")
+
+    spawn = _import_motor_spawn()
+    scan = _import_motor_scan()
+
+    def capture_with_settle(session: str) -> str:
+        # Give kiro a moment to render the startup banner before reading it.
+        time.sleep(1.5)
+        return _tmux_capture_pane(session)
+
+    try:
+        result = journey_mod.create_journey(
+            name,
+            ROOT_DIR,
+            spawn=spawn,
+            session_exists=_tmux_session_exists,
+            capture_pane=capture_with_settle,
+            scan_knights=scan,
+            kill_session=_tmux_kill_session,
+        )
+    except journey_mod.JourneyError as exc:
+        msg = str(exc)
+        # Collision -> 409; invalid name -> 400; everything else -> 500.
+        if "already exists" in msg:
+            raise HTTPException(status_code=409, detail=msg)
+        if "must not be empty" in msg or "no usable characters" in msg:
+            raise HTTPException(status_code=400, detail=msg)
+        raise HTTPException(status_code=500, detail=msg)
+
+    return JourneyResult(ok=True, **result)
