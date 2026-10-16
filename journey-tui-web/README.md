@@ -37,16 +37,26 @@ embeds ONE `ttyd` terminal (main `<iframe>`), switching which knight it shows vi
 
 Requires **Python 3.11+** and `ttyd` + `tmux` on `PATH`.
 
+**Preferred — one-shot installer** (builds the venv, ensures ttyd, installs a
+localhost systemd user service on `127.0.0.1:8787`):
+
+```bash
+bash ~/tmux-mainbrain/install.sh
+# then open http://127.0.0.1:8787/   (stop/remove with uninstall.sh)
+```
+
+**Manual** (foreground, for development):
+
 ```bash
 # Use the project venv's python (the system python3 lacks fastapi).
 # PYTHONPATH must include ~/tmux-mainbrain so `import motor` resolves.
 # No JTW_BOOT_SESSION needed — ttyd boots an auto-created `jtw-console` shell.
 cd ~/tmux-mainbrain/journey-tui-web
 PYTHONPATH=~/tmux-mainbrain TMUX_TMPDIR=/tmp PATH="$HOME/.local/bin:$PATH" \
-  .venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8080
+  .venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8787
 ```
 
-Then open <http://127.0.0.1:8080/>.
+Then open <http://127.0.0.1:8787/>.
 
 > Running as a systemd user service instead? `systemctl --user restart journey-tui-web.service`
 > (the unit no longer pins a knight at boot).
@@ -60,8 +70,8 @@ Then open <http://127.0.0.1:8080/>.
 | `JTW_TTYD_PORT` | `7681` | ttyd listen port |
 | `JTW_TTYD_BIND` | `127.0.0.1` | ttyd bind addr; `0.0.0.0` exposes the terminal on the LAN |
 | `JTW_TTYD_CRED` | _(none)_ | ttyd HTTP basic-auth as `user:pass` (set this whenever the bind isn't localhost) |
-| `JTW_PUBLIC_HOST` | `127.0.0.1` | host a BROWSER uses to reach ttyd — drives the iframe src (LAN IP or DNS name) |
-| `JTW_TTYD_SCHEME` | `http` | scheme the browser uses for ttyd (`https` if fronted by TLS) |
+| `JTW_PUBLIC_HOST` | `127.0.0.1` | host a BROWSER uses to reach ttyd — drives the iframe src (set to the LAN IP for LAN access) |
+| `JTW_TTYD_SCHEME` | `http` | scheme the browser uses for ttyd |
 | `JTW_BOOT_SESSION` | _(empty → auto console)_ | OPTIONAL override to pin ttyd to a specific live session at boot |
 
 > By default (no `JTW_BOOT_SESSION`) the app **auto-creates and boots a console
@@ -71,47 +81,29 @@ Then open <http://127.0.0.1:8080/>.
 
 > The terminal iframe src is **computed at runtime** from `GET /api/config`
 > (`JTW_PUBLIC_HOST` + `JTW_TTYD_PORT` + `JTW_TTYD_SCHEME`), so it is correct for
-> localhost, LAN, or a DNS deployment without editing the static page.
+> localhost or LAN without editing the static page.
 
 ## Security
 
-Localhost (`127.0.0.1`, the default) exposes nothing to the network. ttyd runs
-`tmux attach -W` (writable) — a reachable port 7681 is a **fully interactive,
-unauthenticated terminal** into the knights' sessions.
+This is a **localhost-only, WR-internal tool**. The app binds `127.0.0.1:8787`
+and ttyd binds `127.0.0.1:7681` — nothing is exposed to the network by default.
+ttyd runs `tmux attach -W` (writable): a reachable port 7681 is a **fully
+interactive terminal** into the knights' sessions, so keep it on localhost.
 
-**Never bind beyond localhost without a credential.** When `JTW_TTYD_BIND` is
-`0.0.0.0` (LAN/DNS), set `JTW_TTYD_CRED=user:pass` so ttyd enforces HTTP
+**Never bind beyond localhost without a credential.** If you set `JTW_TTYD_BIND`
+to `0.0.0.0` (LAN), also set `JTW_TTYD_CRED=user:pass` so ttyd enforces HTTP
 basic-auth (verified: no/wrong creds → 401, correct → 200). Put the credential
 in `~/tmux-mainbrain/.env.secrets` (`JTW_TTYD_CRED=...`) rather than the shell
-history or the alias.
+history.
 
-### Reaching it from the LAN
+### Reaching it from another machine on the LAN
 
-Two options:
-
-1. **SSH tunnel (no exposure).** On the remote machine:
-   ```bash
-   ssh -L 8080:localhost:8080 -L 7681:localhost:7681 <user>@<this-host-ip>
-   ```
-   then browse `http://localhost:8080/`. No binds change.
-
-2. **Bind to the LAN (with auth).** Export before launch:
-   ```bash
-   export JTW_BIND=0.0.0.0 JTW_TTYD_BIND=0.0.0.0
-   export JTW_PUBLIC_HOST=<lan-ip-or-dns>      # e.g. 192.168.15.145
-   export JTW_TTYD_CRED=<user>:<pass>
-   # then launch with --host 0.0.0.0:
-   PYTHONPATH=~/tmux-mainbrain TMUX_TMPDIR=/tmp PATH="$HOME/.local/bin:$PATH" \
-     .venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8080
-   ```
-   Open the firewall for ports 8080 and 7681. The terminal will prompt for the
-   basic-auth credentials in the browser.
-
-### DNS deployment
-
-Set `JTW_PUBLIC_HOST` to the DNS name and (if TLS-fronted) `JTW_TTYD_SCHEME=https`.
-Put a reverse proxy (caddy/nginx) in front for TLS on both the app and ttyd;
-keep `JTW_TTYD_CRED` set. The iframe follows `JTW_PUBLIC_HOST` automatically.
+Preferred — an **SSH tunnel** (no network exposure, no binds changed). On the
+remote machine:
+```bash
+ssh -L 8787:localhost:8787 -L 7681:localhost:7681 <user>@<this-host-ip>
+```
+then browse `http://localhost:8787/`.
 
 ## Test
 

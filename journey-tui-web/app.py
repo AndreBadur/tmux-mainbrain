@@ -5,7 +5,7 @@ and owns ONE ttyd child whose tmux client is re-pointed via ``switch-client``.
 
 Run (from this directory):
     PYTHONPATH=~/tmux-mainbrain python3 -m uvicorn app:app \
-        --host 127.0.0.1 --port 8080
+        --host 127.0.0.1 --port 8787
 
 Requirements at runtime:
     * ``ttyd`` and ``tmux`` on PATH.
@@ -57,16 +57,14 @@ TTYD_BIND = os.environ.get("JTW_TTYD_BIND", DEFAULT_BIND)
 TTYD_CRED = os.environ.get("JTW_TTYD_CRED", "").strip() or None
 # The host a BROWSER uses to reach ttyd. The iframe is built from this at
 # runtime (NOT hardcoded), so a remote browser points at the right place:
-#   * localhost dev   -> 127.0.0.1
-#   * LAN             -> this machine's LAN IP (e.g. 192.168.15.145)
-#   * DNS deployment  -> terminal.your-domain
+#   * localhost       -> 127.0.0.1 (default)
+#   * LAN             -> this machine's LAN IP (e.g. 192.168.1.50)
 PUBLIC_HOST = os.environ.get("JTW_PUBLIC_HOST", "127.0.0.1").strip()
-# URL scheme the browser uses for ttyd (http unless you front it with TLS).
+# URL scheme the browser uses for ttyd (http for localhost/LAN).
 TTYD_SCHEME = os.environ.get("JTW_TTYD_SCHEME", "http").strip()
 # The PUBLIC port the browser uses to reach ttyd. Defaults to the local ttyd
-# port (direct/LAN access). Behind a reverse proxy or Cloudflare tunnel the
-# public port is the standard 443/80, so set JTW_PUBLIC_PORT="" (empty) to omit
-# the port from the iframe URL entirely (e.g. https://console-term.domain/).
+# port (direct localhost/LAN access). Set JTW_PUBLIC_PORT="" (empty) to omit the
+# port from the iframe URL (only needed if a reverse proxy serves ttyd on 80/443).
 PUBLIC_PORT = os.environ.get("JTW_PUBLIC_PORT", os.environ.get("JTW_TTYD_PORT", "7681")).strip()
 # OPTIONAL operator override for the boot session. When set AND live, ttyd
 # attaches to it; otherwise (the default) the app auto-creates and boots the
@@ -83,8 +81,8 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 def _terminal_url() -> str:
     """The URL a browser should use for the embedded ttyd terminal.
 
-    Omits the port when ``JTW_PUBLIC_PORT`` is empty (reverse proxy / Cloudflare
-    tunnel serving on the standard 443/80).
+    Omits the port when ``JTW_PUBLIC_PORT`` is empty (a reverse proxy serving
+    ttyd on the standard 80/443).
     """
     host = f"{PUBLIC_HOST}:{PUBLIC_PORT}" if PUBLIC_PORT else PUBLIC_HOST
     return f"{TTYD_SCHEME}://{host}/"
@@ -201,11 +199,11 @@ app.state.startup_error = None
 
 @app.middleware("http")
 async def _no_cache_static(request, call_next):
-    """Tell browsers/CDN to always revalidate the page + static assets.
+    """Tell browsers to always revalidate the page + static assets.
 
     The ETag still allows a cheap 304, but ``no-cache`` forbids serving a stale
     copy WITHOUT revalidating — so a UI update is never masked by a cached
-    index.html / app.js on a phone or behind Cloudflare.
+    index.html / app.js on a phone or a proxy.
     """
     response = await call_next(request)
     path = request.url.path

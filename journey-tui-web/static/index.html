@@ -252,11 +252,12 @@
   <main id="main">
     <!-- Single STATIC iframe: one ttyd port, never reloaded. tmux switches
          underneath via POST /api/switch/{sid}. The src is set at runtime from
-         GET /api/config (JTW_PUBLIC_HOST), so it is correct for localhost, LAN,
-         or a DNS deployment without hardcoding a host here.
-         allow=clipboard-* is REQUIRED: the terminal is a cross-origin iframe
-         (console-term.* vs console.*), and browsers block clipboard access from
-         a cross-origin frame unless the embedder grants it here. -->
+         GET /api/config (JTW_PUBLIC_HOST), so it is correct for localhost or LAN
+         without hardcoding a host here.
+         allow=clipboard-* is REQUIRED: the terminal iframe (ttyd on port 7681)
+         is a different origin from the app (port 8787), and browsers block
+         clipboard access from a cross-origin frame unless the embedder grants
+         it here. -->
     <iframe id="term" title="terminal"
             allow="clipboard-read; clipboard-write"></iframe>
   </main>
