@@ -11,9 +11,17 @@
 #
 set -euo pipefail
 
+# --- local overrides (git-ignored; survives pulls) --------------------------
+# .env.install may set JTW_APP_PORT, JTW_TTYD_PORT, etc. to resolve conflicts
+# with other services on this host (e.g. a system ttyd already on port 7681).
+_ENV_INSTALL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.env.install"
+# shellcheck source=/dev/null
+[ -f "$_ENV_INSTALL" ] && source "$_ENV_INSTALL"
+
 # --- knobs (Phase 3 flips only UNIT) ----------------------------------------
 UNIT="journey-tui-web.service"     # systemd user unit name
 APP_PORT="${JTW_APP_PORT:-8787}"   # app listen port (localhost only)
+TTYD_PORT="${JTW_TTYD_PORT:-7681}" # ttyd listen port (localhost only)
 TTYD_VERSION="1.7.7"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -90,7 +98,8 @@ Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=TMUX_TMPDIR=/tmp
 Environment=JTW_PUBLIC_HOST=127.0.0.1
 Environment=JTW_TTYD_SCHEME=http
-Environment=JTW_PUBLIC_PORT=7681
+Environment=JTW_TTYD_PORT=$TTYD_PORT
+Environment=JTW_PUBLIC_PORT=$TTYD_PORT
 ExecStart=$APP_DIR/.venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port $APP_PORT
 Restart=on-failure
 RestartSec=3
