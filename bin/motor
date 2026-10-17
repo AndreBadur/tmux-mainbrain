@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+#
+# motor — PATH launcher for the motor package (the "Realm root" orchestrator CLI).
+#
+# Lets agents type `motor <tool> [args]` from ANY cwd instead of
+# `cd ~/tmux-mainbrain && python3 -m motor <tool>`.
+#
+# This script self-locates the repo root from its OWN real location (resolving
+# symlinks, because install.sh symlinks it into ~/.local/bin), then execs the
+# package via `python3 -m motor` with "$ROOT" prepended to PYTHONPATH. This is
+# cwd-independent and preserves the package context, so motor/__main__.py's
+# relative imports (`from . import ...`) resolve correctly — unlike running
+# "$ROOT/motor/__main__.py" as a bare script, which has no parent package.
+#
+# Root resolution is intentionally left to motor/paths.py (already
+# cwd-independent, with a TMUX_MAINBRAIN_ROOT override); this launcher only
+# solves the launch/PATH problem.
+#
+set -euo pipefail
+
+# Resolve this script's real directory, even when invoked through a symlink.
+SRC="${BASH_SOURCE[0]}"
+while [ -h "$SRC" ]; do
+  DIR="$(cd -P "$(dirname "$SRC")" && pwd)"
+  SRC="$(readlink "$SRC")"
+  [[ "$SRC" != /* ]] && SRC="$DIR/$SRC"
+done
+ROOT="$(cd -P "$(dirname "$SRC")/.." && pwd)"
+
+command -v python3 >/dev/null 2>&1 || {
+  echo "motor: python3 not found on PATH" >&2
+  exit 127
+}
+
+[ -d "$ROOT/motor" ] || {
+  echo "motor: package dir not found at $ROOT/motor" >&2
+  exit 1
+}
+
+# Prepend the repo root to PYTHONPATH so `python3 -m motor` finds the package
+# from any cwd (safe under `set -u` whether PYTHONPATH is set or not).
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
+exec python3 -m motor "$@"

@@ -50,6 +50,20 @@ if [ -f "$UNIT_DIR/$UNIT" ]; then
 fi
 systemctl --user daemon-reload 2>/dev/null || true
 
+# --- 2b. motor launcher symlink (remove only if it points into this repo) ---
+MOTOR_LINK="$HOME/.local/bin/motor"
+if [ -L "$MOTOR_LINK" ]; then
+  link_target="$(readlink -f "$MOTOR_LINK" 2>/dev/null || true)"
+  if [ "$link_target" = "$ROOT_DIR/bin/motor" ]; then
+    rm -f "$MOTOR_LINK"
+    removed+=("motor launcher symlink $MOTOR_LINK")
+  else
+    kept+=("$MOTOR_LINK (points elsewhere: ${link_target:-unknown} — left alone)")
+  fi
+elif [ -e "$MOTOR_LINK" ]; then
+  kept+=("$MOTOR_LINK (not a symlink — left alone)")
+fi
+
 # --- 3. venv (kept unless --purge-venv) -------------------------------------
 if [ "$PURGE_VENV" -eq 1 ]; then
   if [ -d "$APP_DIR/.venv" ]; then

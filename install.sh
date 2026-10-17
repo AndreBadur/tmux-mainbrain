@@ -55,6 +55,14 @@ else
   echo "installed ttyd -> $HOME/.local/bin/ttyd"
 fi
 
+# --- 1b. motor launcher on PATH (idempotent symlink into ~/.local/bin) ------
+# ~/.local/bin already exists and is on PATH (ensured above). Symlink the
+# repo's bin/motor so agents can run `motor <tool>` from any cwd.
+say "Ensuring motor launcher on PATH"
+[ -x "$ROOT_DIR/bin/motor" ] || die "launcher not found/executable: $ROOT_DIR/bin/motor"
+ln -sf "$ROOT_DIR/bin/motor" "$HOME/.local/bin/motor"
+echo "linked motor -> $HOME/.local/bin/motor ($ROOT_DIR/bin/motor)"
+
 # --- 2. python venv + deps --------------------------------------------------
 say "Setting up the Python venv"
 if [ ! -x "$VENV_PY" ]; then
@@ -124,3 +132,4 @@ printf '\n\033[1;32mDone.\033[0m  Open: http://127.0.0.1:%s\n' "$APP_PORT"
 printf '  Logs:    journalctl --user -u %s -f\n' "$UNIT"
 printf '  Restart: systemctl --user restart %s\n' "$UNIT"
 printf '  Remove:  bash %s/uninstall.sh\n' "$ROOT_DIR"
+printf '  CLI:     motor <tool> [args]   (now on PATH via ~/.local/bin/motor)\n'

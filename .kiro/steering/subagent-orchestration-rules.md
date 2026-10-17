@@ -130,6 +130,49 @@ expensive.
 
 ---
 
+## 2B. CASCADE REGISTRATION — write a spawned knight into `meta.json` (the step that is easy to skip)
+
+A `spawn`/`resume` creates a live kiro-cli runtime — but that runtime is **invisible to the
+cascade** until it is recorded in the journey's state. The web app and any tree view build the
+cascade **exclusively** from `journeys/<id>/meta.json`'s `knights[]`. **A spawned knight that is not
+written into `knights[]` does not exist as far as the cascade is concerned** — a real, easy-to-miss
+workflow error. Registration is a **mechanical step every orchestrator owns**, not king-only lore.
+
+### The rule — the REQUESTER registers, immediately after the spawn resolves
+Whoever **asked for** the knight writes it into `meta.json` — not whoever forged it. (The Steward is
+a **forge, not a parent**: it hands back the knight's data; the requester records it.) Do this the
+moment `spawn`/`resume` returns a resolved `session_id`, **before** you deliver real work — the same
+atomicity you apply to delivery applies to registration.
+
+Append to the journey's `knights[]`:
+```json
+{
+  "role":        "<what this knight is for>",
+  "agent":       "<agent name, e.g. palace-steward>",
+  "session_id":  "<resolved sess_... — never \"\" or null>",
+  "tmux_session":"<tmux name>",
+  "parent":      "<the REQUESTER's session_id — who COMMANDS it>",
+  "level":       2
+}
+```
+- **`parent` = who commands it (the requester), NEVER who forged it.** This keeps the tree a true
+  command hierarchy (who governs whom), not a fabrication log. A knight the King requested is the
+  King's child even though the Steward fabricated it.
+- **`level`** = depth in the keep-tree (1 King, 2 task-knight, 3 specialist). Respect the depth-3
+  ceiling (§2A); a persistent knight beyond L3 needs explicit King/dev approval.
+- **`session_id` must be resolved first.** If `spawn` returned `resolved:false`/`null`, resolve it
+  via `scan_knights` before writing — never persist `""`/`null` (a stale pointer resumes a hollow
+  vessel). Fix the pointer immediately on any kill/re-spawn.
+
+### When NOT to register (be explicit, do not skip silently)
+A **spawn-and-DISCARD** instrument (a one-shot noisy read that returns a verdict and dies) and a
+**throwaway/self-test** spawn do **not** belong in a real journey's `knights[]` — registering them
+would pollute the cascade. But this is a **decision you state**, not a step you forget: if a spawn is
+durable (keep) it MUST be registered; if you deliberately leave it out, say why. The failure mode
+this section exists to prevent is a *keep* knight silently missing from the tree.
+
+---
+
 ## 3. THE FINAL VERDICT CONTRACT (bilateral — sacred)
 
 The contract that lets the orchestrator GET a knight's conclusion cheaply, without peeking.
